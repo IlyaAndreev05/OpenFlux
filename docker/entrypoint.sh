@@ -38,6 +38,9 @@ fi
 if [ -n "${URL:-}" ]; then
   set -- "$@" --url "$URL"
 fi
+if [ -n "${POOL_CONFIG:-}" ]; then
+  set -- "$@" --pool-config "$POOL_CONFIG"
+fi
 if [ -n "${MAX_TOKEN:-}" ]; then
   set -- "$@" --maxToken "$MAX_TOKEN"
 fi

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +59,8 @@ type TCPTunnel struct {
 	exitMode    ExitMode
 	startTime   time.Time
 	packetCount atomic.Uint64
+	statsStop   chan struct{}
+	stopOnce    sync.Once
 }
 
 // TCP buffer size range for gvisor stacks.
@@ -88,6 +92,7 @@ func NewTCPTunnelMode(trans transport.Transport, isExitNode bool, mode ExitMode)
 		isExitNode: isExitNode,
 		exitMode:   mode,
 		startTime:  time.Now(),
+		statsStop:  make(chan struct{}),
 	}
 
 	utils.Debugf("[TUNNEL] Net stack init...")
@@ -143,7 +148,7 @@ func (t *TCPTunnel) setupExitNodeProxy(tunnelNIC tcpip.NICID) {
 
 func (t *TCPTunnel) handleExitTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	dest := fmt.Sprintf("%s:%d", id.LocalAddress.String(), id.LocalPort)
+	dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 
 	var wq waiter.Queue
 	ep, tErr := r.CreateEndpoint(&wq)
@@ -237,17 +242,31 @@ func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		stats := t.gvisorStack.Stats()
-		utils.Debugf("[STATS] uptime=%v mode=%s packets=%d connected=%d established=%d retrans=%d",
-			time.Since(t.startTime).Round(time.Second),
-			t.exitMode.String(),
-			t.packetCount.Load(),
-			stats.TCP.CurrentConnected.Value(),
-			stats.TCP.CurrentEstablished.Value(),
-			stats.TCP.Retransmits.Value(),
-		)
+	for {
+		select {
+		case <-t.statsStop:
+			return
+		case <-ticker.C:
+			stats := t.gvisorStack.Stats()
+			utils.Debugf("[STATS] uptime=%v mode=%s packets=%d connected=%d established=%d retrans=%d",
+				time.Since(t.startTime).Round(time.Second),
+				t.exitMode.String(),
+				t.packetCount.Load(),
+				stats.TCP.CurrentConnected.Value(),
+				stats.TCP.CurrentEstablished.Value(),
+				stats.TCP.Retransmits.Value(),
+			)
+		}
 	}
+}
+
+// Close shuts down the gVisor stack and its periodic statistics worker.
+func (t *TCPTunnel) Close() error {
+	t.stopOnce.Do(func() {
+		close(t.statsStop)
+		t.gvisorStack.Close()
+	})
+	return nil
 }
 
 // ---- local IP helpers (only needed for raw mode) ----

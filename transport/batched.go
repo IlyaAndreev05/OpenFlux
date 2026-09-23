@@ -35,7 +35,13 @@ type BatchedTransport struct {
 	maxBatchBytes int
 	maxBatchCount int
 
-	running atomic.Bool
+	running  atomic.Bool
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	lifeMu   sync.Mutex
+	started  bool
+	stopped  bool
 
 	mu     sync.RWMutex
 	userCb func([]byte)
@@ -51,33 +57,72 @@ func envInt(name string, def int) int {
 }
 
 func NewBatchedTransport(inner Transport) *BatchedTransport {
+	return NewBatchedTransportWithQueue(inner, batchQueueDepth)
+}
+
+// NewBatchedTransportWithQueue creates a batching layer with a bounded number
+// of pending packets. Pool mode uses a smaller queue because it may create up
+// to a thousand independent client transports in one process.
+func NewBatchedTransportWithQueue(inner Transport, queueDepth int) *BatchedTransport {
+	if queueDepth < 1 {
+		queueDepth = batchQueueDepth
+	}
 	return &BatchedTransport{
 		Transport:     inner,
-		queue:         make(chan []byte, batchQueueDepth),
+		queue:         make(chan []byte, queueDepth),
 		lingerMs:      envInt("OPENFLUX_BATCH_LINGER_MS", defaultLingerMs),
 		maxBatchBytes: envInt("OPENFLUX_BATCH_BYTES", defaultMaxBatchBytes),
 		maxBatchCount: envInt("OPENFLUX_BATCH_COUNT", defaultMaxBatchCount),
+		stopCh:        make(chan struct{}),
 	}
 }
 
 func (b *BatchedTransport) Start() error {
+	b.lifeMu.Lock()
+	defer b.lifeMu.Unlock()
+	if b.started || b.stopped {
+		return fmt.Errorf("batched transport cannot be started more than once")
+	}
 	if err := b.Transport.Start(); err != nil {
 		return err
 	}
+	b.started = true
 	b.running.Store(true)
-	go b.flushLoop()
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		b.flushLoop()
+	}()
 	return nil
 }
 
 func (b *BatchedTransport) Stop() error {
+	b.lifeMu.Lock()
+	if b.stopped {
+		b.lifeMu.Unlock()
+		return nil
+	}
+	b.stopped = true
 	b.running.Store(false)
-	return b.Transport.Stop()
+	b.stopOnce.Do(func() { close(b.stopCh) })
+	started := b.started
+	b.lifeMu.Unlock()
+	b.wg.Wait()
+	if started {
+		return b.Transport.Stop()
+	}
+	return nil
 }
 
 // Send copies the packet (the caller's buffer is reused by gVisor) and enqueues
 // it for batching. A full queue drops the packet; the tunnel's TCP will
 // retransmit, same as the old "write queue full" behavior.
 func (b *BatchedTransport) Send(data []byte) error {
+	b.lifeMu.Lock()
+	defer b.lifeMu.Unlock()
+	if !b.running.Load() {
+		return fmt.Errorf("batched transport is not running")
+	}
 	p := make([]byte, len(data))
 	copy(p, data)
 	select {
@@ -113,8 +158,10 @@ func (b *BatchedTransport) Receive(callback func([]byte)) {
 
 func (b *BatchedTransport) flushLoop() {
 	for b.running.Load() {
-		first, ok := <-b.queue
-		if !ok {
+		var first []byte
+		select {
+		case first = <-b.queue:
+		case <-b.stopCh:
 			return
 		}
 		batch := [][]byte{first}
@@ -125,11 +172,7 @@ func (b *BatchedTransport) flushLoop() {
 	drainNow:
 		for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 			select {
-			case p, ok := <-b.queue:
-				if !ok {
-					b.Transport.Send(encodeBatch(batch))
-					return
-				}
+			case p := <-b.queue:
 				batch = append(batch, p)
 				size += 2 + len(p)
 			default:
@@ -145,16 +188,19 @@ func (b *BatchedTransport) flushLoop() {
 		linger:
 			for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 				select {
-				case p, ok := <-b.queue:
-					if !ok {
-						timer.Stop()
-						b.Transport.Send(encodeBatch(batch))
-						return
-					}
+				case p := <-b.queue:
 					batch = append(batch, p)
 					size += 2 + len(p)
 				case <-timer.C:
 					break linger
+				case <-b.stopCh:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
 				}
 			}
 			timer.Stop()

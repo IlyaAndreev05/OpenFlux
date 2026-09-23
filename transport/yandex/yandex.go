@@ -60,6 +60,11 @@ type YandexDocsTransport struct {
 
 	url      string
 	session  *DocSession
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	lifeMu   sync.Mutex
+	started  bool
+	stopped  bool
 
 	userCounter atomic.Int32
 	baseUserID  string
@@ -69,21 +74,52 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig) *Yande
 	t := &YandexDocsTransport{
 		BaseTransport: transport.NewBaseTransport(config),
 		url:           url,
+		stopCh:        make(chan struct{}),
 	}
 	t.baseUserID = randUserID()
 	return t
 }
 
-
 func (t *YandexDocsTransport) Start() error {
+	t.lifeMu.Lock()
+	if t.started || t.stopped {
+		t.lifeMu.Unlock()
+		return fmt.Errorf("Yandex Docs transport cannot be started more than once")
+	}
 	if err := t.BaseTransport.Start(); err != nil {
+		t.lifeMu.Unlock()
 		return err
 	}
+	t.started = true
+	t.lifeMu.Unlock()
 
 	t.baseUserID = randUserID()
 	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
 	t.connectToDoc(0)
 
+	return nil
+}
+
+// Stop closes the active websocket so the reader, writer, and keep-alive
+// goroutines can all exit promptly. The write queue stays open because Send
+// may race with Stop and must return an error rather than panic.
+func (t *YandexDocsTransport) Stop() error {
+	t.lifeMu.Lock()
+	if t.stopped {
+		t.lifeMu.Unlock()
+		return nil
+	}
+	t.stopped = true
+	t.stopOnce.Do(func() { close(t.stopCh) })
+	_ = t.BaseTransport.Stop()
+	t.Mu.Lock()
+	session := t.session
+	t.session = nil
+	t.Mu.Unlock()
+	t.lifeMu.Unlock()
+	if session != nil && session.Conn != nil {
+		_ = session.Conn.Close()
+	}
 	return nil
 }
 
@@ -140,6 +176,9 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			t.scheduleReconnect(attempt)
 			return
 		}
+		if !t.IsRunning() {
+			return
+		}
 
 		// Hard TCP dial timeout so a stuck connect/DNS to the balancer host
 		// can't hang the whole transport (HandshakeTimeout alone proved
@@ -169,6 +208,10 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
+		if !t.IsRunning() {
+			_ = conn.Close()
+			return
+		}
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
@@ -183,8 +226,13 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		}
 
 		t.Mu.Lock()
+		if !t.IsRunning() {
+			t.Mu.Unlock()
+			_ = conn.Close()
+			return
+		}
 		t.session = session
-		t.SetConnected(true)
+		t.SetConnected(false)
 		t.Mu.Unlock()
 
 		if existingSession == nil {
@@ -193,7 +241,12 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		// Auth - use safeWrite
 		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		session.safeWrite(websocket.TextMessage, []byte(auth1))
+		if err := session.safeWrite(websocket.TextMessage, []byte(auth1)); err != nil {
+			utils.Debugf("[YDOCS] Auth write failed: %v", err)
+			_ = conn.Close()
+			t.scheduleReconnect(attempt)
+			return
+		}
 
 		authData := map[string]interface{}{
 			"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
@@ -202,7 +255,20 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
 		}
 		messagePart, _ := json.Marshal([]interface{}{"message", authData})
-		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
+		if err := session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart)))); err != nil {
+			utils.Debugf("[YDOCS] Document auth write failed: %v", err)
+			_ = conn.Close()
+			t.scheduleReconnect(attempt)
+			return
+		}
+		t.Mu.Lock()
+		if !t.IsRunning() {
+			t.Mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		t.SetConnected(true)
+		t.Mu.Unlock()
 
 		connectedAt := time.Now()
 		for t.IsRunning() {
@@ -249,18 +315,20 @@ func (t *YandexDocsTransport) writerLoop() {
 	var pending []byte
 	for t.IsRunning() {
 		if pending == nil {
-			packet, ok := <-queue
-			if !ok {
+			select {
+			case packet := <-queue:
+				pending = packet
+			case <-t.stopCh:
 				return
 			}
-			pending = packet
 		}
 
 		t.Mu.RLock()
 		session := t.session
 		t.Mu.RUnlock()
-		if session == nil || session.Conn == nil {
-			// Mid-reconnect: hold the packet and retry rather than drop it.
+		if session == nil || session.Conn == nil || !t.IsConnected() {
+			// Mid-reconnect/authentication: hold the packet rather than writing
+			// application data before the replacement socket is ready.
 			time.Sleep(15 * time.Millisecond)
 			continue
 		}
@@ -282,7 +350,11 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
 
 	for t.IsRunning() {
-		<-ticker.C
+		select {
+		case <-ticker.C:
+		case <-t.stopCh:
+			return
+		}
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
@@ -362,7 +434,13 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	// turn into a tight connect/close loop (previously reconnect was instant).
 	d := reconnectBackoff(next)
 	utils.Debugf("[YDOCS] reconnecting in %v (attempt %d)", d, next)
-	time.Sleep(d)
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-t.stopCh:
+		return
+	}
 	if !t.IsRunning() {
 		return
 	}

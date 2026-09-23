@@ -62,3 +62,6 @@ watch_stats.sh
 *.log
 openflux
 *.bak
+
+# Local Yandex Docs pool configs and private per-client keys
+pool-config/

@@ -23,10 +23,13 @@ services:
       ROLE: client
       TRANSPORT: ${TRANSPORT:-yandex}
       URL: ${DOC_URL:-}
+      POOL_CONFIG: ${POOL_CONFIG:-}
       MAX_TOKEN: ${MAX_TOKEN:-}
       MAX_UID: ${MAX_UID:-}
       SOCKS5_LISTEN: ${SOCKS5_LISTEN:-:1080}
       DEBUG: ${DEBUG:-0}
+    volumes:
+      - ${POOL_CONFIG_DIR:-./pool-config}:/etc/openflux/pool-config:ro
     # No auth on the SOCKS5 server — keep it bound to the host loopback only.
     ports:
       - "127.0.0.1:1080:1080"
@@ -40,10 +43,13 @@ services:
       ROLE: exit-node
       TRANSPORT: ${TRANSPORT:-yandex}
       URL: ${DOC_URL:-}
+      POOL_CONFIG: ${POOL_CONFIG:-}
       MAX_TOKEN: ${MAX_TOKEN:-}
       MAX_UID: ${MAX_UID:-}
       LOCAL_IP: ${EXIT_LOCAL_IP:-}
       DEBUG: ${DEBUG:-0}
+    volumes:
+      - ${POOL_CONFIG_DIR:-./pool-config}:/etc/openflux/pool-config:ro
     cap_add:
       - NET_RAW
       - NET_ADMIN

@@ -88,6 +88,7 @@ func main() {
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
 	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru)")
+	poolConfigPath := flag.String("pool-config", "", "JSON config for a multi-user Yandex Docs document pool")
 	mode := flag.String("mode", "", "Exit-node mode: l3 (default, Linux only) or l4 (works everywhere)")
 
 	codec := flag.String("codec", codecBatched, "batched (default, zstd+coalescing) or legacy (per-packet LZ4)")
@@ -140,6 +141,7 @@ TRANSPORT
   -u, --url=<URL>              Document URL.
       --maxToken=<token>       MAX auth token (--transport=oneme).
       --maxUid=<uid>           MAX user id   (--transport=oneme).
+      --pool-config=<path>     Multi-user Yandex Docs pool JSON (client or exit).
 
 INBOUND  (only with --role=client)
   -i, --inbound=tun            utun (macOS) / NEPacketTunnel (iOS). Default on macOS.
@@ -174,6 +176,13 @@ DEPRECATED (removed in v2)
 
 	os.Args = expandShortFlags(os.Args)
 	flag.Parse()
+
+	urlExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "url" {
+			urlExplicit = true
+		}
+	})
 
 	// Map deprecated flags to their new counterparts. New flags win over
 	// deprecated ones if both are supplied.
@@ -279,6 +288,43 @@ DEPRECATED (removed in v2)
 	}
 
 	config := transport.DefaultConfig()
+	if *poolConfigPath != "" {
+		if *role != roleClient && *role != roleExit {
+			log.Fatalf("--pool-config supports only --role=client or --role=exit")
+		}
+		if *transportType != "yandex" {
+			log.Fatalf("--pool-config supports only --transport=yandex")
+		}
+		if urlExplicit {
+			log.Fatalf("use documents from --pool-config; do not combine it with --url")
+		}
+		if *encryptionKeyFile != "" {
+			log.Fatalf("--pool-config uses per-client keys; do not combine --encryption-key-file")
+		}
+		poolCfg, err := yandex.LoadPoolConfig(*poolConfigPath, *role)
+		if err != nil {
+			log.Fatalf("pool config: %v", err)
+		}
+		if *role == roleExit {
+			runPoolExit(poolCfg, exitMode, *codec, config)
+		} else {
+			client, err := yandex.NewYandexDocsPoolClient(poolCfg, config)
+			if err != nil {
+				log.Fatalf("create Yandex Docs pool client: %v", err)
+			}
+			var pooled transport.Transport = client
+			if *codec == codecBatched {
+				pooled = transport.NewBatchedTransportWithQueue(pooled, 32)
+			} else {
+				pooled = transport.NewCompressedTransport(pooled)
+			}
+			if err := pooled.Start(); err != nil {
+				log.Fatalf("start Yandex Docs pool client: %v", err)
+			}
+			runClient(pooled, *inbound, *socksAddr, exitMode)
+		}
+		return
+	}
 	var inner transport.Transport
 
 	switch *transportType {
@@ -357,6 +403,44 @@ DEPRECATED (removed in v2)
 	default:
 		log.Fatalf("unhandled role %q", *role)
 	}
+}
+
+func runPoolExit(cfg yandex.PoolConfig, exitMode tunnel.ExitMode, codec string, tc transport.TransportConfig) {
+	exit, err := tunnel.NewPoolExitNode(exitMode)
+	if err != nil {
+		log.Fatalf("pool exit: %v", err)
+	}
+	if err := exit.Start(); err != nil {
+		log.Fatalf("pool exit start: %v", err)
+	}
+	server := yandex.NewYandexDocsPoolServer(cfg, tc, func(session *yandex.PoolSession) {
+		var trans transport.Transport = session
+		if codec == codecBatched {
+			trans = transport.NewBatchedTransportWithQueue(trans, 32)
+		} else {
+			trans = transport.NewCompressedTransport(trans)
+		}
+		if err := trans.Start(); err != nil {
+			log.Printf("pool client %s codec start: %v", session.ClientID(), err)
+			return
+		}
+		if err := exit.AddClient(session.ClientID(), trans); err != nil {
+			log.Printf("pool client %s attach: %v", session.ClientID(), err)
+			_ = trans.Stop()
+		}
+	}, exit.RemoveClient)
+	if err := server.Start(); err != nil {
+		log.Fatalf("pool transport start: %v", err)
+	}
+	log.Printf("Running as multi-user Yandex Docs EXIT (mode=%s, docs=%d, strategy=%s)", exitMode.String(), len(cfg.Docs), cfg.Strategy)
+	if exitMode == tunnel.ExitModeL3 {
+		if localIP != "" {
+			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
+		} else {
+			log.Printf("! Kernel RSTs would tear down L3 flows. Use a dedicated egress IP and scoped RST rule.")
+		}
+	}
+	select {}
 }
 
 func runExit(trans transport.Transport, exitMode tunnel.ExitMode) {

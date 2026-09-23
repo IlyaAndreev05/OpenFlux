@@ -36,7 +36,7 @@ func (f *fakeTransport) Receive(cb func([]byte)) {
 	f.cb = cb
 	f.mu.Unlock()
 }
-func (f *fakeTransport) IsConnected() bool    { return true }
+func (f *fakeTransport) IsConnected() bool     { return true }
 func (f *fakeTransport) Stats() TransportStats { return TransportStats{} }
 
 func (f *fakeTransport) sendCount() int {
@@ -121,5 +121,25 @@ func TestBatchedTransportCoalescesBurstIntoOneMessage(t *testing.T) {
 	}
 	if len(pkts) != n {
 		t.Fatalf("expected %d packets in the batch, got %d", n, len(pkts))
+	}
+}
+
+func TestBatchedTransportStopWakesIdleWorkerAndRejectsSend(t *testing.T) {
+	bt := NewBatchedTransportWithQueue(&fakeTransport{}, 3)
+	if cap(bt.queue) != 3 {
+		t.Fatalf("bounded queue capacity=%d, want 3", cap(bt.queue))
+	}
+	if err := bt.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
+	go func() { _ = bt.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop hung while the flush worker was idle")
+	}
+	if err := bt.Send([]byte("after stop")); err == nil {
+		t.Fatal("Send succeeded after Stop")
 	}
 }

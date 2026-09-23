@@ -255,6 +255,49 @@ Requires sudo. All traffic except the transport goes through the tunnel.
 Point your browser / app at `127.0.0.1:1080` as a SOCKS5 proxy. This is the
 default inbound on non-macOS platforms.
 
+### Pool multiple Yandex Docs and clients
+
+The pool mode supports only `--transport=yandex`. The exit node connects to every document in the shared list and accepts independent client IDs and keys. Each client has its own encryption; multiple clients can use the same document concurrently. The client and exit must use identical `pool_id`, document IDs, and URLs.
+
+Copy the [exit configuration example](docker/pool-exit.example.json) and [client configuration example](docker/pool-client.example.json). Create a random 32-byte key for each client, for example `openssl rand -hex 32 > client-a.key`. The exit config stores the allowed clients and their keys; give each client its own config with the same document list and only that client's key. Replace all example URLs and key material before use.
+
+The exit node supports these strategies:
+
+- `round-robin` — rotate among available documents;
+- `least-loaded` — choose the available document with the fewest assigned active clients (default);
+- `sticky` — keep a client ID on the same available document.
+
+The client checks exit responses with heartbeat requests. If there is no confirmed response for about 10 seconds or a document WebSocket disconnects, it reconnects through another available document. Existing TCP flows remain in the shared exit stack during a document change and may continue within their TCP timeouts. A recovered document receives new assignments; connected clients do not automatically fail back. Queues and frame sizes are bounded for up to 50 documents and 1000 clients.
+
+An optional failover integration test opens a TCP stream to a local echo service, disconnects the active exit WebSocket only inside the test process, and checks that the same TCP stream continues:
+
+```sh
+OPENFLUX_POOL_LIVE=1 go test ./transport/yandex -run '^TestLivePoolFailoverPreservesTCP$' -count=1
+```
+
+The echo service binds to `172.17.0.1` by default; override that address with `OPENFLUX_POOL_TEST_BIND_IP`.
+
+Example exit and two independent SOCKS5 clients:
+
+```sh
+./openflux --role=exit --mode=l4 --transport=yandex --pool-config=exit.json
+./openflux --role=client --inbound=socks5 --transport=yandex --pool-config=client-a.json --socks5=:1080
+./openflux --role=client --inbound=socks5 --transport=yandex --pool-config=client-b.json --socks5=:1081
+```
+
+Pool mode does not use `--url` or `--encryption-key-file`: document URLs are in JSON, and each client receives its own key. The legacy single-`--url` mode remains compatible.
+
+#### Docker
+
+Put JSON configs and key files in `./pool-config` (or set another directory with `POOL_CONFIG_DIR`), then pass the in-container config path:
+
+```sh
+POOL_CONFIG=/etc/openflux/pool-config/exit.json POOL_CONFIG_DIR=./pool-config \
+  docker compose --profile exit-node up -d --build
+POOL_CONFIG=/etc/openflux/pool-config/client-a.json POOL_CONFIG_DIR=./pool-config \
+  docker compose --profile client up -d --build
+```
+
 ### Codec selection
 
 By default the transport uses the batched + zstd codec
@@ -320,7 +363,8 @@ Measure raw goodput through the transport, without touching the host network:
 | `--transport` | `-t` | `yandex` | `yandex` \| `vyandex` \| `oneme` \| `cupsonline` \| `mailru` |
 | `--mode` | `-m` | `l3` | Exit-node mode: `l3` \| `l4` |
 | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
-| `--url` | `-u` | `http://#` | Document URL |
+| `--url` | `-u` | `http://#` | Single-document URL |
+| `--pool-config` | | | JSON config for a Yandex Docs pool client or exit node |
 | `--socks5` | `-s` | `:1080` | SOCKS5 listen address |
 | `--local-ip` | `-l` | (auto) | Egress IP for l3 SNAT / RST filter |
 | `--debug` | `-d` | `false` | Verbose per-packet logging |

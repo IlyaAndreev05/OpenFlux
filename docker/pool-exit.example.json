@@ -1,0 +1,12 @@
+{
+  "pool_id": "replace-with-a-shared-pool-name",
+  "strategy": "least-loaded",
+  "documents": [
+    { "id": "doc-1", "url": "https://disk.yandex.ru/i/REPLACE_ME_1" },
+    { "id": "doc-2", "url": "https://disk.yandex.ru/i/REPLACE_ME_2" }
+  ],
+  "clients": [
+    { "id": "client-a", "key_file": "client-a.key" },
+    { "id": "client-b", "key_file": "client-b.key" }
+  ]
+}
