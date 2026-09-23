@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,27 @@ type PoolExitNode struct {
 }
 
 func NewPoolExitNode(mode ExitMode) (*PoolExitNode, error) {
+	return NewPoolExitNodeWithForward(mode, "", "")
+}
+
+// NewPoolExitNodeWithForward optionally restricts L4 pool traffic to one
+// virtual endpoint and forwards it to one loopback service.
+func NewPoolExitNodeWithForward(mode ExitMode, virtualEndpoint, target string) (*PoolExitNode, error) {
+	var forward *poolL4Forward
+	if virtualEndpoint != "" || target != "" {
+		if mode != ExitModeL4 {
+			return nil, fmt.Errorf("pool forward route requires L4 mode")
+		}
+		virtual, err := netip.ParseAddrPort(virtualEndpoint)
+		if err != nil || !virtual.Addr().Is4() || virtual.Addr().IsLoopback() || virtual.Port() == 0 {
+			return nil, fmt.Errorf("invalid pool forward virtual endpoint %q", virtualEndpoint)
+		}
+		local, err := netip.ParseAddrPort(target)
+		if err != nil || !local.Addr().Is4() || !local.Addr().IsLoopback() || local.Port() == 0 {
+			return nil, fmt.Errorf("pool forward target must be a loopback IPv4 endpoint, got %q", target)
+		}
+		forward = &poolL4Forward{virtualEndpoint: virtual, target: local}
+	}
 	n := &PoolExitNode{mode: mode}
 	if mode == ExitModeL3 {
 		exit, err := l3.NewMultiClientExit()
@@ -39,7 +61,7 @@ func NewPoolExitNode(mode ExitMode) (*PoolExitNode, error) {
 		}
 		n.l3 = exit
 	} else {
-		n.l4 = newMultiProxyExit()
+		n.l4 = newMultiProxyExit(forward)
 	}
 	return n, nil
 }
@@ -83,9 +105,15 @@ type poolL4Client struct {
 	transport.Transport
 }
 
+type poolL4Forward struct {
+	virtualEndpoint netip.AddrPort
+	target          netip.AddrPort
+}
+
 type multiProxyExit struct {
-	stack *stack.Stack
-	ep    *TunnelLinkEndpoint
+	stack   *stack.Stack
+	ep      *TunnelLinkEndpoint
+	forward *poolL4Forward
 
 	mu          sync.RWMutex
 	clients     map[string]*poolL4Client
@@ -96,8 +124,9 @@ type multiProxyExit struct {
 	activeFlows atomic.Int64
 }
 
-func newMultiProxyExit() *multiProxyExit {
+func newMultiProxyExit(forward *poolL4Forward) *multiProxyExit {
 	t := &multiProxyExit{
+		forward:   forward,
 		clients:   make(map[string]*poolL4Client),
 		byIP:      make(map[[4]byte]*poolL4Client),
 		startTime: time.Now(),
@@ -200,6 +229,14 @@ func (t *multiProxyExit) handleExitTCP(r *tcp.ForwarderRequest) {
 	}
 	id := r.ID()
 	dest := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+	resolved, allowed := resolvePoolL4Destination(dest, t.forward)
+	if !allowed {
+		t.activeFlows.Add(-1)
+		r.Complete(true)
+		utils.Debugf("[POOL-L4] rejected destination %s outside configured Xray route", dest)
+		return
+	}
+	dest = resolved
 	var wq waiter.Queue
 	ep, tErr := r.CreateEndpoint(&wq)
 	if tErr != nil {
@@ -336,4 +373,15 @@ func setPoolTCPBuffers(s *stack.Stack) {
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &snd); err != nil {
 		utils.Debugf("[POOL-L4] set send buffer: %v", err)
 	}
+}
+
+func resolvePoolL4Destination(destination string, forward *poolL4Forward) (string, bool) {
+	if forward == nil {
+		return destination, true
+	}
+	requested, err := netip.ParseAddrPort(destination)
+	if err != nil || requested != forward.virtualEndpoint {
+		return "", false
+	}
+	return forward.target.String(), true
 }

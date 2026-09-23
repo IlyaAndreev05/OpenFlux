@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,6 +27,13 @@ type PoolClientKey struct {
 	KeyFile string `json:"key_file"`
 }
 
+// PoolForwardRoute restricts a pool exit to one virtual TCP endpoint and
+// rewrites it to a loopback service on the exit host.
+type PoolForwardRoute struct {
+	VirtualEndpoint string `json:"virtual_endpoint"`
+	Target          string `json:"target"`
+}
+
 // PoolConfig is role-specific after loading: clients contains secrets only on
 // an exit node, while clientID/clientKey are populated on a client.
 type PoolConfig struct {
@@ -35,15 +43,17 @@ type PoolConfig struct {
 	Clients   map[string][32]byte
 	ClientID  string
 	ClientKey [32]byte
+	Forward   *PoolForwardRoute
 }
 
 type poolConfigFile struct {
-	PoolID    string          `json:"pool_id"`
-	Strategy  string          `json:"strategy"`
-	Documents []PoolDocument  `json:"documents"`
-	ClientID  string          `json:"client_id,omitempty"`
-	KeyFile   string          `json:"key_file,omitempty"`
-	Clients   []PoolClientKey `json:"clients,omitempty"`
+	PoolID    string            `json:"pool_id"`
+	Strategy  string            `json:"strategy"`
+	Documents []PoolDocument    `json:"documents"`
+	ClientID  string            `json:"client_id,omitempty"`
+	KeyFile   string            `json:"key_file,omitempty"`
+	Clients   []PoolClientKey   `json:"clients,omitempty"`
+	Forward   *PoolForwardRoute `json:"forward,omitempty"`
 }
 
 func LoadPoolConfig(path, role string) (PoolConfig, error) {
@@ -88,6 +98,9 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 	}
 	switch role {
 	case "client":
+		if raw.Forward != nil {
+			return PoolConfig{}, errors.New("client pool config must not contain forward")
+		}
 		raw.ClientID = strings.TrimSpace(raw.ClientID)
 		if raw.ClientID == "" || len(raw.ClientID) > 64 || strings.ContainsAny(raw.ClientID, "\x00\r\n") {
 			return PoolConfig{}, errors.New("client_id must contain 1 to 64 characters")
@@ -104,6 +117,12 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 			return PoolConfig{}, errors.New("client pool config must not contain strategy or clients")
 		}
 	case "exit":
+		if raw.Forward != nil {
+			if err := validatePoolForwardRoute(*raw.Forward); err != nil {
+				return PoolConfig{}, fmt.Errorf("forward: %w", err)
+			}
+			cfg.Forward = raw.Forward
+		}
 		if len(raw.Clients) == 0 || len(raw.Clients) > MaxPoolClients {
 			return PoolConfig{}, fmt.Errorf("clients must contain 1 to %d entries", MaxPoolClients)
 		}
@@ -140,6 +159,18 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 		return PoolConfig{}, fmt.Errorf("unknown pool role %q", role)
 	}
 	return cfg, nil
+}
+
+func validatePoolForwardRoute(route PoolForwardRoute) error {
+	virtual, err := netip.ParseAddrPort(strings.TrimSpace(route.VirtualEndpoint))
+	if err != nil || !virtual.Addr().Is4() || virtual.Addr().IsLoopback() || virtual.Port() == 0 {
+		return errors.New("virtual_endpoint must be a non-loopback IPv4 address and port")
+	}
+	target, err := netip.ParseAddrPort(strings.TrimSpace(route.Target))
+	if err != nil || !target.Addr().Is4() || !target.Addr().IsLoopback() || target.Port() == 0 {
+		return errors.New("target must be a loopback IPv4 address and port")
+	}
+	return nil
 }
 
 func readPoolKey(path string) ([32]byte, error) {

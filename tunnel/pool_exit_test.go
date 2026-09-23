@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"encoding/binary"
+	"net/netip"
 	"testing"
 )
 
@@ -44,4 +45,43 @@ func TestPoolRewriteIPv4AddressRecalculatesChecksums(t *testing.T) {
 	if _, ok := poolRewriteIPv4Address(fragment, 12, oldSrc, newSrc); ok {
 		t.Fatal("fragmented TCP packet was accepted")
 	}
+}
+
+func TestPoolL4ForwardRouteAllowsOnlyConfiguredEndpoint(t *testing.T) {
+	forward := &poolL4Forward{
+		virtualEndpoint: netip.MustParseAddrPort("198.18.0.1:18443"),
+		target:          netip.MustParseAddrPort("127.0.0.1:18443"),
+	}
+	got, ok := resolvePoolL4Destination("198.18.0.1:18443", forward)
+	if !ok || got != "127.0.0.1:18443" {
+		t.Fatalf("resolved=%q allowed=%v", got, ok)
+	}
+	for _, destination := range []string{"198.18.0.1:80", "198.18.0.2:18443", "127.0.0.1:18443", "invalid"} {
+		if got, ok := resolvePoolL4Destination(destination, forward); ok {
+			t.Fatalf("accepted destination %q as %q", destination, got)
+		}
+	}
+	if got, ok := resolvePoolL4Destination("203.0.113.7:443", nil); !ok || got != "203.0.113.7:443" {
+		t.Fatalf("legacy unrestricted mode changed: %q allowed=%v", got, ok)
+	}
+}
+
+func TestPoolExitForwardRequiresLoopbackTargetAndL4(t *testing.T) {
+	for _, tc := range []struct {
+		mode   ExitMode
+		target string
+	}{
+		{ExitModeL3, "127.0.0.1:18443"},
+		{ExitModeL4, "203.0.113.1:18443"},
+		{ExitModeL4, "[::1]:18443"},
+	} {
+		if _, err := NewPoolExitNodeWithForward(tc.mode, "198.18.0.1:18443", tc.target); err == nil {
+			t.Fatalf("accepted mode=%s target=%q", tc.mode, tc.target)
+		}
+	}
+	node, err := NewPoolExitNodeWithForward(ExitModeL4, "198.18.0.1:18443", "127.0.0.1:18443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = node.Stop()
 }

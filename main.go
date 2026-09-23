@@ -406,7 +406,13 @@ DEPRECATED (removed in v2)
 }
 
 func runPoolExit(cfg yandex.PoolConfig, exitMode tunnel.ExitMode, codec string, tc transport.TransportConfig) {
-	exit, err := tunnel.NewPoolExitNode(exitMode)
+	var exit *tunnel.PoolExitNode
+	var err error
+	if cfg.Forward != nil {
+		exit, err = tunnel.NewPoolExitNodeWithForward(exitMode, cfg.Forward.VirtualEndpoint, cfg.Forward.Target)
+	} else {
+		exit, err = tunnel.NewPoolExitNode(exitMode)
+	}
 	if err != nil {
 		log.Fatalf("pool exit: %v", err)
 	}

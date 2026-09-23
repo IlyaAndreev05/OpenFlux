@@ -191,6 +191,7 @@ func TestLoadPoolConfigPerRole(t *testing.T) {
 	exitPath := writeConfig("exit.json", map[string]any{
 		"pool_id": "test", "strategy": "round-robin", "documents": docs,
 		"clients": []map[string]string{{"id": "alice", "key_file": "alice.key"}},
+		"forward": map[string]string{"virtual_endpoint": "198.18.0.1:18443", "target": "127.0.0.1:18443"},
 	})
 	exit, err := LoadPoolConfig(exitPath, "exit")
 	if err != nil {
@@ -198,6 +199,24 @@ func TestLoadPoolConfigPerRole(t *testing.T) {
 	}
 	if exit.Strategy != "round-robin" || exit.Clients["alice"][31] != 31 {
 		t.Fatalf("bad exit config: %#v", exit)
+	}
+	if exit.Forward == nil || exit.Forward.VirtualEndpoint != "198.18.0.1:18443" || exit.Forward.Target != "127.0.0.1:18443" {
+		t.Fatalf("bad forward route: %#v", exit.Forward)
+	}
+	invalidRoute := writeConfig("invalid-route.json", map[string]any{
+		"pool_id": "test", "documents": docs,
+		"clients": []map[string]string{{"id": "alice", "key_file": "alice.key"}},
+		"forward": map[string]string{"virtual_endpoint": "198.18.0.1:18443", "target": "203.0.113.5:18443"},
+	})
+	if _, err := LoadPoolConfig(invalidRoute, "exit"); err == nil {
+		t.Fatal("accepted non-loopback forward target")
+	}
+	invalidClientRoute := writeConfig("invalid-client-route.json", map[string]any{
+		"pool_id": "test", "documents": docs, "client_id": "alice", "key_file": "alice.key",
+		"forward": map[string]string{"virtual_endpoint": "198.18.0.1:18443", "target": "127.0.0.1:18443"},
+	})
+	if _, err := LoadPoolConfig(invalidClientRoute, "client"); err == nil {
+		t.Fatal("accepted exit-only forward route on client config")
 	}
 	invalid := writeConfig("invalid.json", map[string]any{
 		"pool_id": "test", "strategy": "random", "documents": docs,
