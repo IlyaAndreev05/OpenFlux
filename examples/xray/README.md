@@ -53,3 +53,19 @@ XRAY_BIN=/path/to/xray OPENFLUX_TEST_TRANSPORT=memory KEEP_TMP=1 \
 This checks the Xray-to-Xray behavior through OpenFlux's real SOCKS and L4
 forwarding code, but skips Yandex Docs assignment, pool encryption, and live
 failover. A passing smoke test does not satisfy the live document test.
+
+## Raw TCP ingress experiment
+
+Set `OPENFLUX_CLIENT_INGRESS=tcp` to make each Xray VLESS+TLS outbound connect
+directly to its local OpenFlux TCP listener. Xray keeps `serverName` set to
+`xray.local`; OpenFlux carries the byte stream to `198.18.0.1:18443`. The Xray
+outbound has no `sockopt.dialerProxy` and no SOCKS outbound:
+
+```sh
+XRAY_BIN=/path/to/xray OPENFLUX_TEST_TRANSPORT=memory \
+  OPENFLUX_CLIENT_INGRESS=tcp ./examples/xray/run-local.sh
+```
+
+For the Yandex-backed run, omit `OPENFLUX_TEST_TRANSPORT=memory`. Each OpenFlux
+client binds `127.0.0.1` at a generated port by default; use
+`--tcp-listen=127.0.0.1:PORT` to choose a fixed port when launching it manually.

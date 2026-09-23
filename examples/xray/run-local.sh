@@ -9,6 +9,11 @@ DOC1="${OPENFLUX_POOL_DOC1:-}"
 DOC2="${OPENFLUX_POOL_DOC2:-}"
 XRAY_BIN="${XRAY_BIN:-$(command -v xray || true)}"
 OPENFLUX_BIN="${OPENFLUX_BIN:-}"
+INGRESS_MODE="${OPENFLUX_CLIENT_INGRESS:-socks5}"
+case "$INGRESS_MODE" in
+  socks5|tcp) ;;
+  *) echo "OPENFLUX_CLIENT_INGRESS must be socks5 or tcp" >&2; exit 2 ;;
+esac
 
 if [[ -z "$XRAY_BIN" || ! -x "$XRAY_BIN" ]]; then
   echo "Set XRAY_BIN to an executable Xray v26.9.8+ binary." >&2
@@ -104,7 +109,7 @@ POOL_ID="xray-e2e-$(openssl rand -hex 8)"
 
 export WORK DOC1 DOC2 POOL_ID HTTP_PORT API_PORT CLIENT_A_SOCKS CLIENT_B_SOCKS
 TLS_PIN="$(openssl x509 -noout -fingerprint -sha256 -in "$WORK/xray.crt" | sed 's/.*=//')"
-export XRAY_CLIENT_1 XRAY_CLIENT_2 XRAY_CLIENT_3 UUID1 UUID2 UUID3 TLS_PIN
+export XRAY_CLIENT_1 XRAY_CLIENT_2 XRAY_CLIENT_3 UUID1 UUID2 UUID3 TLS_PIN INGRESS_MODE
 python3 - <<'PY'
 import json, os
 from pathlib import Path
@@ -152,7 +157,7 @@ write("xray-exit.json", {
              "tlsSettings": {"certificates": [{"certificateFile": str(w / "xray.crt"),
                                                   "keyFile": str(w / "xray.key")}]}}},
         {"listen": "127.0.0.1", "port": int(os.environ["API_PORT"]), "tag": "api-in",
-         "protocol": " dokodemo-door ".strip(), "settings": {"address": "127.0.0.1"}},
+         "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}},
     ],
     "outbounds": [{"protocol": "freedom", "tag": "direct", "settings": {
                       "finalRules": [{"action": "allow", "network": "tcp",
@@ -166,23 +171,35 @@ for i, (listen, edge_port) in enumerate([
     (int(os.environ["XRAY_CLIENT_2"]), int(os.environ["CLIENT_A_SOCKS"])),
     (int(os.environ["XRAY_CLIENT_3"]), int(os.environ["CLIENT_B_SOCKS"])),
 ], 1):
+    stream = {"network": "tcp", "security": "tls", "tlsSettings": {
+        "serverName": "xray.local",
+        "pinnedPeerCertSha256": os.environ["TLS_PIN"],
+        "verifyPeerCertByName": "xray.local",
+    }}
+    if os.environ["INGRESS_MODE"] == "socks5":
+        server_address, server_port = "198.18.0.1", 18443
+        stream["sockopt"] = {"dialerProxy": "openflux-socks"}
+        outbounds = [
+            {"tag": "vless-out", "protocol": "vless", "settings": {"vnext": [{
+                "address": server_address, "port": server_port,
+                "users": [{"id": os.environ[f"UUID{i}"], "encryption": "none"}],
+            }]}, "streamSettings": stream},
+            {"tag": "openflux-socks", "protocol": "socks", "settings": {"servers": [{
+                "address": "127.0.0.1", "port": edge_port,
+            }]}}
+        ]
+    else:
+        # Xray connects to OpenFlux's raw TCP listener. TLS SNI stays xray.local.
+        server_address, server_port = "127.0.0.1", edge_port
+        outbounds = [{"tag": "vless-out", "protocol": "vless", "settings": {"vnext": [{
+            "address": server_address, "port": server_port,
+            "users": [{"id": os.environ[f"UUID{i}"], "encryption": "none"}],
+        }]}, "streamSettings": stream}]
     write(f"xray-client-{i}.json", {
         "log": {"loglevel": "debug"},
         "inbounds": [{"listen": "127.0.0.1", "port": listen, "tag": "local-socks",
                       "protocol": "socks", "settings": {"auth": "noauth", "udp": False}}],
-        "outbounds": [
-            {"tag": "vless-out", "protocol": "vless", "settings": {"vnext": [{
-                "address": "198.18.0.1", "port": 18443,
-                "users": [{"id": os.environ[f"UUID{i}"], "encryption": "none"}],
-            }]}, "streamSettings": {"network": "tcp", "security": "tls",
-                "tlsSettings": {"serverName": "xray.local",
-                    "pinnedPeerCertSha256": os.environ["TLS_PIN"],
-                    "verifyPeerCertByName": "xray.local"},
-                "sockopt": {"dialerProxy": "openflux-socks"}}},
-            {"tag": "openflux-socks", "protocol": "socks", "settings": {"servers": [{
-                "address": "127.0.0.1", "port": edge_port,
-            }]}}
-        ],
+        "outbounds": outbounds,
         "routing": {"rules": [{"type": "field", "inboundTag": ["local-socks"],
                                   "outboundTag": "vless-out"}]},
     })
@@ -212,19 +229,28 @@ wait_port "$API_PORT"
 if [[ "${OPENFLUX_TEST_TRANSPORT:-yandex}" == "memory" ]]; then
   (cd "$REPO_ROOT" && go build -o "$WORK/mockhub" ./examples/xray/mockhub)
   "$WORK/mockhub" --listen-a="127.0.0.1:$CLIENT_A_SOCKS" \
-    --listen-b="127.0.0.1:$CLIENT_B_SOCKS" \
+    --listen-b="127.0.0.1:$CLIENT_B_SOCKS" --ingress="$INGRESS_MODE" \
     --virtual=198.18.0.1:18443 --target=127.0.0.1:18443 > "$WORK/openflux-mockhub.log" 2>&1 & PIDS+=("$!")
   wait_port "$CLIENT_A_SOCKS"
   wait_port "$CLIENT_B_SOCKS"
 else
   "$OPENFLUX_BIN" --role=exit --transport=yandex --mode=l4 --codec=batched \
     --pool-config "$WORK/exit-pool.json" --debug > "$WORK/openflux-exit.log" 2>&1 & PIDS+=("$!")
-  "$OPENFLUX_BIN" --role=client --transport=yandex --mode=l4 --codec=batched \
-    --pool-config "$WORK/edge-a-pool.json" --inbound=socks5 --socks5="127.0.0.1:$CLIENT_A_SOCKS" \
-    --debug > "$WORK/openflux-edge-a.log" 2>&1 & PIDS+=("$!")
-  "$OPENFLUX_BIN" --role=client --transport=yandex --mode=l4 --codec=batched \
-    --pool-config "$WORK/edge-b-pool.json" --inbound=socks5 --socks5="127.0.0.1:$CLIENT_B_SOCKS" \
-    --debug > "$WORK/openflux-edge-b.log" 2>&1 & PIDS+=("$!")
+  if [[ "$INGRESS_MODE" == "socks5" ]]; then
+    "$OPENFLUX_BIN" --role=client --transport=yandex --mode=l4 --codec=batched \
+      --pool-config "$WORK/edge-a-pool.json" --inbound=socks5 --socks5="127.0.0.1:$CLIENT_A_SOCKS" \
+      --debug > "$WORK/openflux-edge-a.log" 2>&1 & PIDS+=("$!")
+    "$OPENFLUX_BIN" --role=client --transport=yandex --mode=l4 --codec=batched \
+      --pool-config "$WORK/edge-b-pool.json" --inbound=socks5 --socks5="127.0.0.1:$CLIENT_B_SOCKS" \
+      --debug > "$WORK/openflux-edge-b.log" 2>&1 & PIDS+=("$!")
+  else
+    "$OPENFLUX_BIN" --role=client --transport=yandex --mode=l4 --codec=batched \
+      --pool-config "$WORK/edge-a-pool.json" --inbound=tcp --tcp-listen="127.0.0.1:$CLIENT_A_SOCKS" \
+      --debug > "$WORK/openflux-edge-a.log" 2>&1 & PIDS+=("$!")
+    "$OPENFLUX_BIN" --role=client --transport=yandex --mode=l4 --codec=batched \
+      --pool-config "$WORK/edge-b-pool.json" --inbound=tcp --tcp-listen="127.0.0.1:$CLIENT_B_SOCKS" \
+      --debug > "$WORK/openflux-edge-b.log" 2>&1 & PIDS+=("$!")
+  fi
   wait_port "$CLIENT_A_SOCKS"
   wait_port "$CLIENT_B_SOCKS"
 fi
@@ -270,7 +296,7 @@ wait_assigned_docs() {
 
 case "${OPENFLUX_TEST_TRANSPORT:-yandex}" in
   memory)
-    echo "OpenFlux transport: in-memory loopback (Yandex Docs pool bypassed)"
+    echo "OpenFlux transport: in-memory loopback (Yandex Docs pool bypassed); ingress=$INGRESS_MODE"
     ;;
   yandex)
     wait_assigned_docs

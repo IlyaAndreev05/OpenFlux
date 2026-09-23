@@ -75,6 +75,7 @@ const (
 const (
 	inboundTUN    = "tun"
 	inboundSOCKS5 = "socks5"
+	inboundTCP    = "tcp"
 )
 
 const (
@@ -100,6 +101,7 @@ func main() {
 	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
+	tcpListen := flag.String("tcp-listen", "127.0.0.1:1081", "Raw TCP ingress bind address (Yandex pool client only)")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
@@ -146,7 +148,9 @@ TRANSPORT
 INBOUND  (only with --role=client)
   -i, --inbound=tun            utun (macOS) / NEPacketTunnel (iOS). Default on macOS.
   -i, --inbound=socks5         SOCKS5 + gVisor. Default on other platforms.
+  -i, --inbound=tcp            Raw TCP stream ingress (pool config only; experiment).
   -s, --socks5=<addr>          SOCKS5 listen address (default :1080).
+      --tcp-listen=<addr>      Raw TCP ingress address (default 127.0.0.1:1081).
 
 MODE  (only with --role=exit)
   -m, --mode=l3                Packet forwarding (SNAT/DNAT). Default.
@@ -243,8 +247,8 @@ DEPRECATED (removed in v2)
 
 	switch *role {
 	case roleClient:
-		if *inbound != inboundTUN && *inbound != inboundSOCKS5 {
-			log.Fatalf("--role=client: unknown --inbound=%q (want tun|socks5)", *inbound)
+		if *inbound != inboundTUN && *inbound != inboundSOCKS5 && *inbound != inboundTCP {
+			log.Fatalf("--role=client: unknown --inbound=%q (want tun|socks5|tcp)", *inbound)
 		}
 	case roleExit:
 		if *mode != "l3" && *mode != "l4" {
@@ -258,6 +262,9 @@ DEPRECATED (removed in v2)
 
 	// Warn when the exit runs on l4 (gVisor): it works everywhere but is
 	// slower than l3 (SNAT/DNAT, Linux only, needs root + iptables).
+	if *inbound == inboundTCP && *poolConfigPath == "" {
+		log.Fatalf("--inbound=tcp requires --pool-config (Yandex pool client only)")
+	}
 	if *role == roleExit && *mode == "l4" {
 		log.Printf("warning: exit on l4 (gVisor). l3 is faster on Linux with root.")
 	}
@@ -321,7 +328,11 @@ DEPRECATED (removed in v2)
 			if err := pooled.Start(); err != nil {
 				log.Fatalf("start Yandex Docs pool client: %v", err)
 			}
-			runClient(pooled, *inbound, *socksAddr, exitMode)
+			if *inbound == inboundTCP {
+				runTCPIngress(pooled, *tcpListen)
+			} else {
+				runClient(pooled, *inbound, *socksAddr, exitMode)
+			}
 		}
 		return
 	}

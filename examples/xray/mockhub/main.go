@@ -1,5 +1,5 @@
 // Command mockhub runs an offline Xray/OpenFlux TCP path for environments
-// where Yandex Docs are unreachable. It exercises OpenFlux's SOCKS ingress,
+// where Yandex Docs are unreachable. It exercises OpenFlux's SOCKS or raw TCP ingress,
 // packet tunnel, and fixed-address pool-exit forwarding without the Yandex
 // Docs WebSocket transport or its pool cipher.
 package main
@@ -7,6 +7,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -53,7 +54,11 @@ func (m *memoryTransport) Send(data []byte) error {
 
 var nextID atomic.Uint64
 
-func attachEdge(exit *tunnel.PoolExitNode, listen string) (*socks5.SOCKS5Server, *tunnel.TCPTunnel, error) {
+type closer interface {
+	Close() error
+}
+
+func attachEdge(exit *tunnel.PoolExitNode, listen, ingress string) (closer, *tunnel.TCPTunnel, error) {
 	clientLink, exitLink := newMemoryPair()
 	id := fmt.Sprintf("mock-edge-%d", nextID.Add(1))
 	if err := clientLink.Start(); err != nil {
@@ -69,20 +74,71 @@ func attachEdge(exit *tunnel.PoolExitNode, listen string) (*socks5.SOCKS5Server,
 		return nil, nil, err
 	}
 	clientTunnel := tunnel.NewTCPTunnelMode(clientLink, false, tunnel.ExitModeL4)
-	server := socks5.NewSOCKS5Server(listen, clientTunnel)
-	if err := server.Bind(); err != nil {
+	var listener closer
+	switch ingress {
+	case "socks5":
+		server := socks5.NewSOCKS5Server(listen, clientTunnel)
+		if err := server.Bind(); err != nil {
+			_ = clientTunnel.Close()
+			_ = clientLink.Stop()
+			_ = exitLink.Stop()
+			return nil, nil, err
+		}
+		listener = server
+		go func() {
+			if err := server.Start(); err != nil && err != net.ErrClosed {
+				log.Printf("SOCKS5 %s stopped: %v", listen, err)
+			}
+		}()
+	case "tcp":
+		tcpListener, err := net.Listen("tcp", listen)
+		if err != nil {
+			_ = clientTunnel.Close()
+			_ = clientLink.Stop()
+			_ = exitLink.Stop()
+			return nil, nil, err
+		}
+		listener = tcpListener
+		go serveTCP(tcpListener, clientTunnel)
+	default:
 		_ = clientTunnel.Close()
 		_ = clientLink.Stop()
 		_ = exitLink.Stop()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("unknown ingress %q", ingress)
 	}
-	go func() {
-		if err := server.Start(); err != nil && err != net.ErrClosed {
-			log.Printf("SOCKS5 %s stopped: %v", listen, err)
+	log.Printf("mock OpenFlux %s edge ready on %s", ingress, listen)
+	return listener, clientTunnel, nil
+}
+
+func serveTCP(listener net.Listener, tun *tunnel.TCPTunnel) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
 		}
-	}()
-	log.Printf("mock OpenFlux edge ready on %s", listen)
-	return server, clientTunnel, nil
+		go func(local net.Conn) {
+			defer local.Close()
+			remote, err := tun.DialTCP("198.18.0.1:18443")
+			if err != nil {
+				log.Printf("mock TCP ingress dial: %v", err)
+				return
+			}
+			defer remote.Close()
+			done := make(chan struct{})
+			go func() {
+				_, _ = io.Copy(remote, local)
+				if cw, ok := remote.(interface{ CloseWrite() error }); ok {
+					_ = cw.CloseWrite()
+				}
+				close(done)
+			}()
+			_, _ = io.Copy(local, remote)
+			if cw, ok := local.(interface{ CloseWrite() error }); ok {
+				_ = cw.CloseWrite()
+			}
+			<-done
+		}(conn)
+	}
 }
 
 func main() {
@@ -91,6 +147,7 @@ func main() {
 	listenB := flag.String("listen-b", "127.0.0.1:1082", "second local OpenFlux SOCKS5 listener")
 	virtual := flag.String("virtual", "198.18.0.1:18443", "only allowed virtual destination")
 	target := flag.String("target", "127.0.0.1:18443", "loopback Xray exit listener")
+	ingress := flag.String("ingress", "socks5", "socks5 or tcp")
 	flag.Parse()
 
 	exit, err := tunnel.NewPoolExitNodeWithForward(tunnel.ExitModeL4, *virtual, *target)
@@ -100,11 +157,11 @@ func main() {
 	if err := exit.Start(); err != nil {
 		log.Fatal(err)
 	}
-	serverA, tunnelA, err := attachEdge(exit, *listenA)
+	serverA, tunnelA, err := attachEdge(exit, *listenA, *ingress)
 	if err != nil {
 		log.Fatal(err)
 	}
-	serverB, tunnelB, err := attachEdge(exit, *listenB)
+	serverB, tunnelB, err := attachEdge(exit, *listenB, *ingress)
 	if err != nil {
 		_ = serverA.Close()
 		_ = tunnelA.Close()
