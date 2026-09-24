@@ -87,7 +87,7 @@ func main() {
 	fmt.Print("written by p1neappleXpress\n")
 
 	role := flag.String("role", roleClient, "client | exit | bench-send | bench-sink")
-	inbound := flag.String("inbound", "", "tun | socks5 (client only; default: tun on macOS, socks5 elsewhere)")
+	inbound := flag.String("inbound", "", "tun | socks5 | tcp (client only; default: tun on macOS, socks5 elsewhere)")
 	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme, cupsonline, mailru)")
 	poolConfigPath := flag.String("pool-config", "", "JSON config for a multi-user Yandex Docs document pool")
 	mode := flag.String("mode", "", "Exit-node mode: l3 (default, Linux only) or l4 (works everywhere)")
@@ -102,6 +102,7 @@ func main() {
 	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
 	tcpListen := flag.String("tcp-listen", "127.0.0.1:1081", "Raw TCP ingress bind address (Yandex pool client only)")
+	tcpTarget := flag.String("tcp-target", "", "Raw TCP ingress destination host:port (overrides client pool config)")
 	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (l3 mode only, scoped RST drop)")
 
 	benchBytes := flag.Int("bench-bytes", 0, "Benchmark: push this many MB through the transport, then report and exit")
@@ -150,7 +151,8 @@ INBOUND  (only with --role=client)
   -i, --inbound=socks5         SOCKS5 + gVisor. Default on other platforms.
   -i, --inbound=tcp            Raw TCP stream ingress (pool config only; experiment).
   -s, --socks5=<addr>          SOCKS5 listen address (default :1080).
-      --tcp-listen=<addr>      Raw TCP ingress address (default 127.0.0.1:1081).
+      --tcp-listen=<addr>      Raw TCP ingress bind address (default 127.0.0.1:1081).
+      --tcp-target=<host:port> Raw TCP ingress destination; required for --inbound=tcp unless tcp_target is set in client pool config.
 
 MODE  (only with --role=exit)
   -m, --mode=l3                Packet forwarding (SNAT/DNAT). Default.
@@ -265,6 +267,9 @@ DEPRECATED (removed in v2)
 	if *inbound == inboundTCP && *poolConfigPath == "" {
 		log.Fatalf("--inbound=tcp requires --pool-config (Yandex pool client only)")
 	}
+	if *tcpTarget != "" && (*role != roleClient || *inbound != inboundTCP) {
+		log.Fatalf("--tcp-target is only valid with --role=client --inbound=tcp")
+	}
 	if *role == roleExit && *mode == "l4" {
 		log.Printf("warning: exit on l4 (gVisor). l3 is faster on Linux with root.")
 	}
@@ -315,6 +320,18 @@ DEPRECATED (removed in v2)
 		if *role == roleExit {
 			runPoolExit(poolCfg, exitMode, *codec, config)
 		} else {
+			target := strings.TrimSpace(*tcpTarget)
+			if target == "" {
+				target = poolCfg.TCPTarget
+			}
+			if *inbound == inboundTCP {
+				if target == "" {
+					log.Fatalf("--inbound=tcp requires --tcp-target or client pool config tcp_target")
+				}
+				if err := validateTCPIngressTarget(target); err != nil {
+					log.Fatalf("TCP ingress target: %v", err)
+				}
+			}
 			client, err := yandex.NewYandexDocsPoolClient(poolCfg, config)
 			if err != nil {
 				log.Fatalf("create Yandex Docs pool client: %v", err)
@@ -329,7 +346,7 @@ DEPRECATED (removed in v2)
 				log.Fatalf("start Yandex Docs pool client: %v", err)
 			}
 			if *inbound == inboundTCP {
-				runTCPIngress(pooled, *tcpListen)
+				runTCPIngress(pooled, *tcpListen, target)
 			} else {
 				runClient(pooled, *inbound, *socksAddr, exitMode)
 			}
@@ -420,7 +437,14 @@ func runPoolExit(cfg yandex.PoolConfig, exitMode tunnel.ExitMode, codec string, 
 	var exit *tunnel.PoolExitNode
 	var err error
 	if cfg.Forward != nil {
-		exit, err = tunnel.NewPoolExitNodeWithForward(exitMode, cfg.Forward.VirtualEndpoint, cfg.Forward.Target)
+		routes := make([]tunnel.PoolForwardRoute, len(cfg.Forward.Routes))
+		for i, route := range cfg.Forward.Routes {
+			routes[i] = tunnel.PoolForwardRoute{
+				VirtualEndpoint: route.VirtualEndpoint,
+				Target:          route.Target,
+			}
+		}
+		exit, err = tunnel.NewPoolExitNodeWithRoutes(exitMode, routes, cfg.Forward.Unmatched)
 	} else {
 		exit, err = tunnel.NewPoolExitNode(exitMode)
 	}

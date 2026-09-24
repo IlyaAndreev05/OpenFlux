@@ -5,20 +5,24 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
+	"strings"
 
 	"openflux/transport"
 	"openflux/tunnel"
 )
 
-const poolVirtualXrayEndpoint = "198.18.0.1:18443"
-
-// runTCPIngress forwards every local TCP stream to the one virtual Xray
-// endpoint. It is intended for a local Xray client whose VLESS/TLS outbound
-// already targets this OpenFlux listener, so Xray needs no dialerProxy.
-func runTCPIngress(trans transport.Transport, listenAddr string) {
+// runTCPIngress forwards each accepted TCP stream to the configured target.
+// Since a raw TCP stream contains no destination metadata, the target must be
+// supplied by the user (or loaded from the pool client config).
+func runTCPIngress(trans transport.Transport, listenAddr, target string) {
 	if err := validateTCPIngressListenAddress(listenAddr); err != nil {
 		log.Fatalf("TCP ingress: %v", err)
 	}
+	if err := validateTCPIngressTarget(target); err != nil {
+		log.Fatalf("TCP ingress target: %v", err)
+	}
+	target = strings.TrimSpace(target)
 	tun := tunnel.NewTCPTunnelMode(trans, false, tunnel.ExitModeL4)
 	defer tun.Close()
 	listener, err := net.Listen("tcp", listenAddr)
@@ -26,7 +30,7 @@ func runTCPIngress(trans transport.Transport, listenAddr string) {
 		log.Fatalf("TCP ingress listen on %s: %v", listenAddr, err)
 	}
 	defer listener.Close()
-	log.Printf("Running as CLIENT (TCP ingress on %s -> %s)", listenAddr, poolVirtualXrayEndpoint)
+	log.Printf("Running as CLIENT (TCP ingress on %s -> %s)", listenAddr, target)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -37,15 +41,15 @@ func runTCPIngress(trans transport.Transport, listenAddr string) {
 			log.Printf("TCP ingress stopped: %v", err)
 			return
 		}
-		go relayPoolTCP(tun, conn)
+		go relayPoolTCP(tun, target, conn)
 	}
 }
 
-func relayPoolTCP(tun *tunnel.TCPTunnel, local net.Conn) {
+func relayPoolTCP(tun *tunnel.TCPTunnel, target string, local net.Conn) {
 	defer local.Close()
-	remote, err := tun.DialTCP(poolVirtualXrayEndpoint)
+	remote, err := tun.DialTCP(target)
 	if err != nil {
-		log.Printf("TCP ingress dial %s: %v", poolVirtualXrayEndpoint, err)
+		log.Printf("TCP ingress dial %s: %v", target, err)
 		return
 	}
 	defer remote.Close()
@@ -72,6 +76,21 @@ func validateTCPIngressListenAddress(listenAddr string) error {
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("listen address %q must use a loopback IP", listenAddr)
+	}
+	return nil
+}
+
+func validateTCPIngressTarget(target string) error {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(target))
+	if err != nil || host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "\x00\r\n/?#") {
+		return fmt.Errorf("target %q must be a host:port TCP destination", target)
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return fmt.Errorf("target %q uses IPv6, but the pool TCP tunnel currently supports IPv4", target)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("target %q port must be between 1 and 65535", target)
 	}
 	return nil
 }

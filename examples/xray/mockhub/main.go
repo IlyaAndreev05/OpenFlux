@@ -1,7 +1,8 @@
 // Command mockhub runs an offline Xray/OpenFlux TCP path for environments
-// where Yandex Docs are unreachable. It exercises OpenFlux's SOCKS or raw TCP ingress,
-// packet tunnel, and fixed-address pool-exit forwarding without the Yandex
-// Docs WebSocket transport or its pool cipher.
+// where Yandex Docs are unreachable. It exercises OpenFlux's SOCKS and raw TCP
+// ingress, packet tunnel, and configured pool-exit forwarding without the Yandex
+// Docs WebSocket transport or its pool cipher. Supply the virtual destination
+// and mapped target explicitly with --virtual and --target.
 package main
 
 import (
@@ -58,7 +59,7 @@ type closer interface {
 	Close() error
 }
 
-func attachEdge(exit *tunnel.PoolExitNode, listen, ingress string) (closer, *tunnel.TCPTunnel, error) {
+func attachEdge(exit *tunnel.PoolExitNode, listen, ingress, virtual string) (closer, *tunnel.TCPTunnel, error) {
 	clientLink, exitLink := newMemoryPair()
 	id := fmt.Sprintf("mock-edge-%d", nextID.Add(1))
 	if err := clientLink.Start(); err != nil {
@@ -99,7 +100,7 @@ func attachEdge(exit *tunnel.PoolExitNode, listen, ingress string) (closer, *tun
 			return nil, nil, err
 		}
 		listener = tcpListener
-		go serveTCP(tcpListener, clientTunnel)
+		go serveTCP(tcpListener, clientTunnel, virtual)
 	default:
 		_ = clientTunnel.Close()
 		_ = clientLink.Stop()
@@ -110,7 +111,7 @@ func attachEdge(exit *tunnel.PoolExitNode, listen, ingress string) (closer, *tun
 	return listener, clientTunnel, nil
 }
 
-func serveTCP(listener net.Listener, tun *tunnel.TCPTunnel) {
+func serveTCP(listener net.Listener, tun *tunnel.TCPTunnel, target string) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -118,7 +119,7 @@ func serveTCP(listener net.Listener, tun *tunnel.TCPTunnel) {
 		}
 		go func(local net.Conn) {
 			defer local.Close()
-			remote, err := tun.DialTCP("198.18.0.1:18443")
+			remote, err := tun.DialTCP(target)
 			if err != nil {
 				log.Printf("mock TCP ingress dial: %v", err)
 				return
@@ -145,10 +146,13 @@ func main() {
 	utils.EnableDebug()
 	listenA := flag.String("listen-a", "127.0.0.1:1081", "first local OpenFlux SOCKS5 listener")
 	listenB := flag.String("listen-b", "127.0.0.1:1082", "second local OpenFlux SOCKS5 listener")
-	virtual := flag.String("virtual", "198.18.0.1:18443", "only allowed virtual destination")
-	target := flag.String("target", "127.0.0.1:18443", "loopback Xray exit listener")
+	virtual := flag.String("virtual", "", "virtual destination for the Xray server (required)")
+	target := flag.String("target", "", "destination to which the virtual address is mapped (required)")
 	ingress := flag.String("ingress", "socks5", "socks5 or tcp")
 	flag.Parse()
+	if *virtual == "" || *target == "" {
+		log.Fatal("--virtual and --target are required")
+	}
 
 	exit, err := tunnel.NewPoolExitNodeWithForward(tunnel.ExitModeL4, *virtual, *target)
 	if err != nil {
@@ -157,11 +161,11 @@ func main() {
 	if err := exit.Start(); err != nil {
 		log.Fatal(err)
 	}
-	serverA, tunnelA, err := attachEdge(exit, *listenA, *ingress)
+	serverA, tunnelA, err := attachEdge(exit, *listenA, *ingress, *virtual)
 	if err != nil {
 		log.Fatal(err)
 	}
-	serverB, tunnelB, err := attachEdge(exit, *listenB, *ingress)
+	serverB, tunnelB, err := attachEdge(exit, *listenB, *ingress, *virtual)
 	if err != nil {
 		_ = serverA.Close()
 		_ = tunnelA.Close()

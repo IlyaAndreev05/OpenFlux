@@ -37,9 +37,32 @@ certificate only for this local test. The script deletes the directory after a
 successful run. Set `KEEP_TMP=1` to retain generated configs and logs for
 inspection.
 
-The exit Xray listens only on `127.0.0.1:18443`, and the OpenFlux exit config
-allows only virtual destination `198.18.0.1:18443`, rewritten to that loopback
-listener. The HTTP test service and Xray API also bind to loopback.
+The test runner generates a virtual IPv4 endpoint and an available Xray listen
+port for each run. Override `OPENFLUX_XRAY_VIRTUAL_ENDPOINT=IP:PORT` and
+`OPENFLUX_XRAY_EXIT_PORT=PORT` to select them. The generated exit config maps
+that endpoint to the local Xray listener and denies unmatched destinations.
+The HTTP test service and Xray API also bind to loopback.
+
+OpenFlux does not require Xray. For ordinary direct egress, omit `forward` from
+the pool exit config; the L4 exit connects to the destination requested by
+SOCKS5/TUN. To chain through an Xray or another local/remote TCP service,
+configure exact routes on the exit. For example:
+
+```json
+"forward": {
+  "routes": [
+    { "virtual_endpoint": "192.0.2.10:443", "target": "127.0.0.1:443" },
+    { "virtual_endpoint": "192.0.2.11:8443", "target": "xray.internal:8443" }
+  ],
+  "unmatched": "deny"
+}
+```
+
+The address on the left is selected by the operator/client config and is only
+a route key; it does not come from Yandex. `unmatched` can be `direct` when
+unlisted destinations should use normal direct egress. Routes match exact
+IPv4 TCP endpoints. The older single-route `forward.virtual_endpoint` /
+`forward.target` format remains supported.
 
 To validate the Xray TLS/VLESS, OpenFlux TCP relay, per-user counters, and
 HandlerService locally while Yandex is unavailable, run the same scenario with
@@ -58,8 +81,10 @@ failover. A passing smoke test does not satisfy the live document test.
 
 Set `OPENFLUX_CLIENT_INGRESS=tcp` to make each Xray VLESS+TLS outbound connect
 directly to its local OpenFlux TCP listener. Xray keeps `serverName` set to
-`xray.local`; OpenFlux carries the byte stream to `198.18.0.1:18443`. The Xray
-outbound has no `sockopt.dialerProxy` and no SOCKS outbound:
+`xray.local`; OpenFlux sends each accepted byte stream to the `tcp_target` in
+the client pool config (or the `--tcp-target=host:port` CLI override). The
+runner sets this to the generated virtual endpoint used by the exit route. The
+Xray outbound has no `sockopt.dialerProxy` and no SOCKS outbound:
 
 ```sh
 XRAY_BIN=/path/to/xray OPENFLUX_TEST_TRANSPORT=memory \
@@ -69,3 +94,5 @@ XRAY_BIN=/path/to/xray OPENFLUX_TEST_TRANSPORT=memory \
 For the Yandex-backed run, omit `OPENFLUX_TEST_TRANSPORT=memory`. Each OpenFlux
 client binds `127.0.0.1` at a generated port by default; use
 `--tcp-listen=127.0.0.1:PORT` to choose a fixed port when launching it manually.
+
+Raw TCP ingress cannot infer an arbitrary destination from a byte stream, so it requires one configured target. SOCKS5 and TUN preserve each connection’s requested destination and can use direct egress or exit routes without this option.

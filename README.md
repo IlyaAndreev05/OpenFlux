@@ -285,6 +285,26 @@ Example exit and two independent SOCKS5 clients:
 ./openflux --role=client --inbound=socks5 --transport=yandex --pool-config=client-b.json --socks5=:1081
 ```
 
+The pool exit works without Xray: when the exit config omits `forward`, it
+connects directly to the destination supplied by SOCKS5 or TUN. To pass selected
+connections through Xray or another TCP service, add explicit routes to the
+exit config:
+
+```json
+"forward": {
+  "routes": [
+    { "virtual_endpoint": "192.0.2.10:443", "target": "127.0.0.1:443" },
+    { "virtual_endpoint": "192.0.2.11:8443", "target": "xray.internal:8443" }
+  ],
+  "unmatched": "deny"
+}
+```
+
+Each rule maps one exact IPv4 TCP address and port to a host and port. Set
+`unmatched` to `direct` to send unlisted destinations directly; the default with
+routes is `deny`. Existing single-route configs using
+`forward.virtual_endpoint` and `forward.target` are still accepted.
+
 Pool mode does not use `--url` or `--encryption-key-file`: document URLs are in JSON, and each client receives its own key. The legacy single-`--url` mode remains compatible.
 
 #### Docker
