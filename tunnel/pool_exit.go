@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,26 +33,62 @@ type PoolExitNode struct {
 }
 
 func NewPoolExitNode(mode ExitMode) (*PoolExitNode, error) {
-	return NewPoolExitNodeWithForward(mode, "", "")
+	return NewPoolExitNodeWithRoutes(mode, nil, "")
 }
 
-// NewPoolExitNodeWithForward optionally restricts L4 pool traffic to one
-// virtual endpoint and forwards it to one loopback service.
+// PoolForwardRoute maps an exact virtual TCP destination to a configured
+// network destination. Virtual endpoints must be IPv4 because the pool L4
+// tunnel currently carries IPv4 TCP packets.
+type PoolForwardRoute struct {
+	VirtualEndpoint string
+	Target          string
+}
+
+const (
+	PoolForwardUnmatchedDeny   = "deny"
+	PoolForwardUnmatchedDirect = "direct"
+)
+
+// NewPoolExitNodeWithForward preserves the original single-route API.
 func NewPoolExitNodeWithForward(mode ExitMode, virtualEndpoint, target string) (*PoolExitNode, error) {
+	return NewPoolExitNodeWithRoutes(mode, []PoolForwardRoute{{
+		VirtualEndpoint: virtualEndpoint,
+		Target:          target,
+	}}, PoolForwardUnmatchedDeny)
+}
+
+// NewPoolExitNodeWithRoutes optionally maps exact L4 destinations. With no
+// routes, traffic is dialed directly as in the standard pool exit. When routes
+// are configured, unmatched destinations are denied by default.
+func NewPoolExitNodeWithRoutes(mode ExitMode, routes []PoolForwardRoute, unmatched string) (*PoolExitNode, error) {
 	var forward *poolL4Forward
-	if virtualEndpoint != "" || target != "" {
+	if len(routes) > 0 {
 		if mode != ExitModeL4 {
-			return nil, fmt.Errorf("pool forward route requires L4 mode")
+			return nil, fmt.Errorf("pool forward routes require L4 mode")
 		}
-		virtual, err := netip.ParseAddrPort(virtualEndpoint)
-		if err != nil || !virtual.Addr().Is4() || virtual.Addr().IsLoopback() || virtual.Port() == 0 {
-			return nil, fmt.Errorf("invalid pool forward virtual endpoint %q", virtualEndpoint)
+		if unmatched == "" {
+			unmatched = PoolForwardUnmatchedDeny
 		}
-		local, err := netip.ParseAddrPort(target)
-		if err != nil || !local.Addr().Is4() || !local.Addr().IsLoopback() || local.Port() == 0 {
-			return nil, fmt.Errorf("pool forward target must be a loopback IPv4 endpoint, got %q", target)
+		if unmatched != PoolForwardUnmatchedDeny && unmatched != PoolForwardUnmatchedDirect {
+			return nil, fmt.Errorf("unknown unmatched route policy %q (want deny|direct)", unmatched)
 		}
-		forward = &poolL4Forward{virtualEndpoint: virtual, target: local}
+		forwardRoutes := make(map[netip.AddrPort]string, len(routes))
+		for _, route := range routes {
+			virtual, err := netip.ParseAddrPort(strings.TrimSpace(route.VirtualEndpoint))
+			if err != nil || !virtual.Addr().Is4() || virtual.Port() == 0 {
+				return nil, fmt.Errorf("invalid pool forward virtual endpoint %q", route.VirtualEndpoint)
+			}
+			if _, exists := forwardRoutes[virtual]; exists {
+				return nil, fmt.Errorf("duplicate pool forward virtual endpoint %q", virtual)
+			}
+			if err := validatePoolForwardTarget(route.Target); err != nil {
+				return nil, fmt.Errorf("invalid pool forward target %q: %w", route.Target, err)
+			}
+			forwardRoutes[virtual] = strings.TrimSpace(route.Target)
+		}
+		forward = &poolL4Forward{routes: forwardRoutes, unmatched: unmatched}
+	} else if unmatched != "" {
+		return nil, fmt.Errorf("unmatched policy requires at least one pool forward route")
 	}
 	n := &PoolExitNode{mode: mode}
 	if mode == ExitModeL3 {
@@ -64,6 +101,18 @@ func NewPoolExitNodeWithForward(mode ExitMode, virtualEndpoint, target string) (
 		n.l4 = newMultiProxyExit(forward)
 	}
 	return n, nil
+}
+
+func validatePoolForwardTarget(value string) error {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil || host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "\x00\r\n/?#") {
+		return fmt.Errorf("must be a host:port TCP destination")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	return nil
 }
 
 func (n *PoolExitNode) Start() error {
@@ -106,8 +155,8 @@ type poolL4Client struct {
 }
 
 type poolL4Forward struct {
-	virtualEndpoint netip.AddrPort
-	target          netip.AddrPort
+	routes    map[netip.AddrPort]string
+	unmatched string
 }
 
 type multiProxyExit struct {
@@ -380,8 +429,14 @@ func resolvePoolL4Destination(destination string, forward *poolL4Forward) (strin
 		return destination, true
 	}
 	requested, err := netip.ParseAddrPort(destination)
-	if err != nil || requested != forward.virtualEndpoint {
+	if err != nil {
 		return "", false
 	}
-	return forward.target.String(), true
+	if target, ok := forward.routes[requested]; ok {
+		return target, true
+	}
+	if forward.unmatched == PoolForwardUnmatchedDirect {
+		return destination, true
+	}
+	return "", false
 }

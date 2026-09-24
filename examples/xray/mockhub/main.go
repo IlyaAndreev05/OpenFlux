@@ -1,7 +1,8 @@
 // Command mockhub runs an offline Xray/OpenFlux TCP path for environments
 // where Yandex Docs are unreachable. It exercises OpenFlux's SOCKS ingress,
-// packet tunnel, and fixed-address pool-exit forwarding without the Yandex
-// Docs WebSocket transport or its pool cipher.
+// packet tunnel, and configured pool-exit forwarding without the Yandex
+// Docs WebSocket transport or its pool cipher. Supply the virtual destination
+// and mapped target explicitly with --virtual and --target.
 package main
 
 import (
@@ -89,9 +90,12 @@ func main() {
 	utils.EnableDebug()
 	listenA := flag.String("listen-a", "127.0.0.1:1081", "first local OpenFlux SOCKS5 listener")
 	listenB := flag.String("listen-b", "127.0.0.1:1082", "second local OpenFlux SOCKS5 listener")
-	virtual := flag.String("virtual", "198.18.0.1:18443", "only allowed virtual destination")
-	target := flag.String("target", "127.0.0.1:18443", "loopback Xray exit listener")
+	virtual := flag.String("virtual", "", "virtual destination for the Xray server (required)")
+	target := flag.String("target", "", "destination to which the virtual address is mapped (required)")
 	flag.Parse()
+	if *virtual == "" || *target == "" {
+		log.Fatal("--virtual and --target are required")
+	}
 
 	exit, err := tunnel.NewPoolExitNodeWithForward(tunnel.ExitModeL4, *virtual, *target)
 	if err != nil {

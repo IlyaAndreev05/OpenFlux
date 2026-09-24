@@ -37,9 +37,32 @@ certificate only for this local test. The script deletes the directory after a
 successful run. Set `KEEP_TMP=1` to retain generated configs and logs for
 inspection.
 
-The exit Xray listens only on `127.0.0.1:18443`, and the OpenFlux exit config
-allows only virtual destination `198.18.0.1:18443`, rewritten to that loopback
-listener. The HTTP test service and Xray API also bind to loopback.
+The test runner generates a virtual IPv4 endpoint and an available Xray listen
+port for each run. Override `OPENFLUX_XRAY_VIRTUAL_ENDPOINT=IP:PORT` and
+`OPENFLUX_XRAY_EXIT_PORT=PORT` to select them. The generated exit config maps
+that endpoint to the local Xray listener and denies unmatched destinations.
+The HTTP test service and Xray API also bind to loopback.
+
+OpenFlux does not require Xray. For ordinary direct egress, omit `forward` from
+the pool exit config; the L4 exit connects to the destination requested by
+SOCKS5/TUN. To chain through an Xray or another local/remote TCP service,
+configure exact routes on the exit. For example:
+
+```json
+"forward": {
+  "routes": [
+    { "virtual_endpoint": "192.0.2.10:443", "target": "127.0.0.1:443" },
+    { "virtual_endpoint": "192.0.2.11:8443", "target": "xray.internal:8443" }
+  ],
+  "unmatched": "deny"
+}
+```
+
+The address on the left is selected by the operator/client config and is only
+a route key; it does not come from Yandex. `unmatched` can be `direct` when
+unlisted destinations should use normal direct egress. Routes match exact
+IPv4 TCP endpoints. The older single-route `forward.virtual_endpoint` /
+`forward.target` format remains supported.
 
 To validate the Xray TLS/VLESS, OpenFlux TCP relay, per-user counters, and
 HandlerService locally while Yandex is unavailable, run the same scenario with

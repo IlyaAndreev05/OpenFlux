@@ -200,16 +200,57 @@ func TestLoadPoolConfigPerRole(t *testing.T) {
 	if exit.Strategy != "round-robin" || exit.Clients["alice"][31] != 31 {
 		t.Fatalf("bad exit config: %#v", exit)
 	}
-	if exit.Forward == nil || exit.Forward.VirtualEndpoint != "198.18.0.1:18443" || exit.Forward.Target != "127.0.0.1:18443" {
+	if exit.Forward == nil || exit.Forward.VirtualEndpoint != "198.18.0.1:18443" || exit.Forward.Target != "127.0.0.1:18443" ||
+		len(exit.Forward.Routes) != 1 || exit.Forward.Routes[0].Target != "127.0.0.1:18443" || exit.Forward.Unmatched != "deny" {
 		t.Fatalf("bad forward route: %#v", exit.Forward)
+	}
+	multiRoute := writeConfig("multi-route.json", map[string]any{
+		"pool_id": "test", "documents": docs,
+		"clients": []map[string]string{{"id": "alice", "key_file": "alice.key"}},
+		"forward": map[string]any{
+			"routes": []map[string]string{
+				{"virtual_endpoint": "198.18.0.1:18443", "target": "127.0.0.1:18443"},
+				{"virtual_endpoint": "198.18.0.2:443", "target": "xray.example:443"},
+			},
+			"unmatched": "direct",
+		},
+	})
+	multi, err := LoadPoolConfig(multiRoute, "exit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if multi.Forward == nil || len(multi.Forward.Routes) != 2 || multi.Forward.Unmatched != "direct" {
+		t.Fatalf("bad multi-route config: %#v", multi.Forward)
+	}
+	duplicateRoute := writeConfig("duplicate-route.json", map[string]any{
+		"pool_id": "test", "documents": docs,
+		"clients": []map[string]string{{"id": "alice", "key_file": "alice.key"}},
+		"forward": map[string]any{"routes": []map[string]string{
+			{"virtual_endpoint": "198.18.0.1:18443", "target": "127.0.0.1:18443"},
+			{"virtual_endpoint": "198.18.0.1:18443", "target": "xray.example:443"},
+		}},
+	})
+	if _, err := LoadPoolConfig(duplicateRoute, "exit"); err == nil {
+		t.Fatal("accepted duplicate forward endpoint")
+	}
+	ambiguousRoute := writeConfig("ambiguous-route.json", map[string]any{
+		"pool_id": "test", "documents": docs,
+		"clients": []map[string]string{{"id": "alice", "key_file": "alice.key"}},
+		"forward": map[string]any{
+			"virtual_endpoint": "198.18.0.1:18443", "target": "127.0.0.1:18443",
+			"routes": []map[string]string{{"virtual_endpoint": "198.18.0.2:443", "target": "xray.example:443"}},
+		},
+	})
+	if _, err := LoadPoolConfig(ambiguousRoute, "exit"); err == nil {
+		t.Fatal("accepted mixed legacy and route-list fields")
 	}
 	invalidRoute := writeConfig("invalid-route.json", map[string]any{
 		"pool_id": "test", "documents": docs,
 		"clients": []map[string]string{{"id": "alice", "key_file": "alice.key"}},
-		"forward": map[string]string{"virtual_endpoint": "198.18.0.1:18443", "target": "203.0.113.5:18443"},
+		"forward": map[string]string{"virtual_endpoint": "198.18.0.1:18443", "target": "xray.example"},
 	})
 	if _, err := LoadPoolConfig(invalidRoute, "exit"); err == nil {
-		t.Fatal("accepted non-loopback forward target")
+		t.Fatal("accepted forward target without a port")
 	}
 	invalidClientRoute := writeConfig("invalid-client-route.json", map[string]any{
 		"pool_id": "test", "documents": docs, "client_id": "alice", "key_file": "alice.key",

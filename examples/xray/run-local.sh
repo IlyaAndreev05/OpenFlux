@@ -81,9 +81,31 @@ if [[ -z "$XRAY_VERSION" ]]; then
   exit 2
 fi
 
-for p in 18443; do
-  port_free "$p" || { echo "Required fixed port 127.0.0.1:$p is already in use" >&2; exit 2; }
-done
+XRAY_EXIT_PORT="${OPENFLUX_XRAY_EXIT_PORT:-$(free_port)}"
+if ! [[ "$XRAY_EXIT_PORT" =~ ^[0-9]+$ ]] || (( XRAY_EXIT_PORT < 1 || XRAY_EXIT_PORT > 65535 )); then
+  echo "OPENFLUX_XRAY_EXIT_PORT must be between 1 and 65535" >&2
+  exit 2
+fi
+port_free "$XRAY_EXIT_PORT" || { echo "Xray exit port 127.0.0.1:$XRAY_EXIT_PORT is already in use" >&2; exit 2; }
+XRAY_VIRTUAL_ENDPOINT="${OPENFLUX_XRAY_VIRTUAL_ENDPOINT:-}"
+if [[ -z "$XRAY_VIRTUAL_ENDPOINT" ]]; then
+  XRAY_VIRTUAL_ENDPOINT="$(python3 -c 'import ipaddress, secrets, sys; base=int(ipaddress.IPv4Address("198.18.0.0")); print(f"{ipaddress.IPv4Address(base + secrets.randbelow(131070) + 1)}:{sys.argv[1]}")' "$XRAY_EXIT_PORT")"
+fi
+XRAY_VIRTUAL_PARTS="$(python3 -c '
+import ipaddress, sys
+host, sep, port = sys.argv[1].rpartition(":")
+if not sep:
+    raise SystemExit("virtual endpoint must be IPv4:port")
+try:
+    address = ipaddress.IPv4Address(host)
+    number = int(port)
+except ValueError as exc:
+    raise SystemExit(f"invalid virtual endpoint: {exc}")
+if not 1 <= number <= 65535:
+    raise SystemExit("virtual endpoint port must be between 1 and 65535")
+print(address, number)
+' "$XRAY_VIRTUAL_ENDPOINT")"
+read -r XRAY_VIRTUAL_IP XRAY_VIRTUAL_PORT <<< "$XRAY_VIRTUAL_PARTS"
 HTTP_PORT="$(free_port)"
 API_PORT="$(free_port)"
 CLIENT_A_SOCKS="$(free_port)"
@@ -103,6 +125,7 @@ UUID3="$("$XRAY_BIN" uuid)"
 POOL_ID="xray-e2e-$(openssl rand -hex 8)"
 
 export WORK DOC1 DOC2 POOL_ID HTTP_PORT API_PORT CLIENT_A_SOCKS CLIENT_B_SOCKS
+export XRAY_EXIT_PORT XRAY_VIRTUAL_ENDPOINT XRAY_VIRTUAL_IP XRAY_VIRTUAL_PORT
 TLS_PIN="$(openssl x509 -noout -fingerprint -sha256 -in "$WORK/xray.crt" | sed 's/.*=//')"
 export XRAY_CLIENT_1 XRAY_CLIENT_2 XRAY_CLIENT_3 UUID1 UUID2 UUID3 TLS_PIN
 python3 - <<'PY'
@@ -120,8 +143,11 @@ write("exit-pool.json", {
     "strategy": "least-loaded",
     "documents": docs,
     "forward": {
-        "virtual_endpoint": "198.18.0.1:18443",
-        "target": "127.0.0.1:18443",
+        "routes": [{
+            "virtual_endpoint": os.environ["XRAY_VIRTUAL_ENDPOINT"],
+            "target": f"127.0.0.1:{os.environ['XRAY_EXIT_PORT']}",
+        }],
+        "unmatched": "deny",
     },
     "clients": [
         {"id": "edge-a", "key_file": "edge-a.key"},
@@ -146,7 +172,7 @@ write("xray-exit.json", {
         "statsUserOnline": True,
     }}},
     "inbounds": [
-        {"listen": "127.0.0.1", "port": 18443, "tag": "vless-in",
+        {"listen": "127.0.0.1", "port": int(os.environ["XRAY_EXIT_PORT"]), "tag": "vless-in",
          "protocol": "vless", "settings": {"clients": users, "decryption": "none"},
          "streamSettings": {"network": "tcp", "security": "tls",
              "tlsSettings": {"certificates": [{"certificateFile": str(w / "xray.crt"),
@@ -172,7 +198,7 @@ for i, (listen, edge_port) in enumerate([
                       "protocol": "socks", "settings": {"auth": "noauth", "udp": False}}],
         "outbounds": [
             {"tag": "vless-out", "protocol": "vless", "settings": {"vnext": [{
-                "address": "198.18.0.1", "port": 18443,
+                "address": os.environ["XRAY_VIRTUAL_IP"], "port": int(os.environ["XRAY_VIRTUAL_PORT"]),
                 "users": [{"id": os.environ[f"UUID{i}"], "encryption": "none"}],
             }]}, "streamSettings": {"network": "tcp", "security": "tls",
                 "tlsSettings": {"serverName": "xray.local",
@@ -187,7 +213,7 @@ for i, (listen, edge_port) in enumerate([
                                   "outboundTag": "vless-out"}]},
     })
 (w / "user-2.json").write_text(json.dumps({"inbounds": [{"tag": "vless-in",
-    "listen": "127.0.0.1", "port": 18443, "protocol": "vless",
+    "listen": "127.0.0.1", "port": int(os.environ["XRAY_EXIT_PORT"]), "protocol": "vless",
     "settings": {"clients": [users[1]], "decryption": "none"}}]}, indent=2) + "\n")
 PY
 
@@ -207,13 +233,13 @@ PY
 PIDS+=("$!")
 wait_port "$HTTP_PORT"
 "$XRAY_BIN" run -c "$WORK/xray-exit.json" > "$WORK/xray-exit.log" 2>&1 & PIDS+=("$!")
-wait_port 18443
+wait_port "$XRAY_EXIT_PORT"
 wait_port "$API_PORT"
 if [[ "${OPENFLUX_TEST_TRANSPORT:-yandex}" == "memory" ]]; then
   (cd "$REPO_ROOT" && go build -o "$WORK/mockhub" ./examples/xray/mockhub)
   "$WORK/mockhub" --listen-a="127.0.0.1:$CLIENT_A_SOCKS" \
     --listen-b="127.0.0.1:$CLIENT_B_SOCKS" \
-    --virtual=198.18.0.1:18443 --target=127.0.0.1:18443 > "$WORK/openflux-mockhub.log" 2>&1 & PIDS+=("$!")
+    --virtual="$XRAY_VIRTUAL_ENDPOINT" --target="127.0.0.1:$XRAY_EXIT_PORT" > "$WORK/openflux-mockhub.log" 2>&1 & PIDS+=("$!")
   wait_port "$CLIENT_A_SOCKS"
   wait_port "$CLIENT_B_SOCKS"
 else

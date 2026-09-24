@@ -289,6 +289,27 @@ OPENFLUX_POOL_LIVE=1 go test ./transport/yandex -run '^TestLivePoolFailoverPrese
 ./openflux --role=client --inbound=socks5 --transport=yandex --pool-config=client-b.json --socks5=:1081
 ```
 
+Xray для пула не обязателен: если в exit-конфиге нет `forward`, OpenFlux
+напрямую подключается к адресу, который передали SOCKS5 или TUN. Чтобы
+направлять выбранные соединения через Xray или другой TCP-сервис, добавьте в
+exit-конфиг явные маршруты:
+
+```json
+"forward": {
+  "routes": [
+    { "virtual_endpoint": "192.0.2.10:443", "target": "127.0.0.1:443" },
+    { "virtual_endpoint": "192.0.2.11:8443", "target": "xray.internal:8443" }
+  ],
+  "unmatched": "deny"
+}
+```
+
+Каждое правило сопоставляет точный IPv4 TCP-адрес и порт с другим адресом и
+портом. Значение `unmatched` задаёт поведение для адресов без правила:
+`direct` отправляет их напрямую, значение по умолчанию при наличии маршрутов —
+`deny`. Старые конфиги с одним `forward.virtual_endpoint` и
+`forward.target` продолжают работать.
+
 В пуле параметры `--url` и `--encryption-key-file` не используются: URL документов задаются в JSON, а ключи выдаются отдельно каждому клиенту. Старый режим с одним `--url` остаётся совместимым.
 
 #### Docker

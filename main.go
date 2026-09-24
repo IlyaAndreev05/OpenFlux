@@ -409,7 +409,14 @@ func runPoolExit(cfg yandex.PoolConfig, exitMode tunnel.ExitMode, codec string, 
 	var exit *tunnel.PoolExitNode
 	var err error
 	if cfg.Forward != nil {
-		exit, err = tunnel.NewPoolExitNodeWithForward(exitMode, cfg.Forward.VirtualEndpoint, cfg.Forward.Target)
+		routes := make([]tunnel.PoolForwardRoute, len(cfg.Forward.Routes))
+		for i, route := range cfg.Forward.Routes {
+			routes[i] = tunnel.PoolForwardRoute{
+				VirtualEndpoint: route.VirtualEndpoint,
+				Target:          route.Target,
+			}
+		}
+		exit, err = tunnel.NewPoolExitNodeWithRoutes(exitMode, routes, cfg.Forward.Unmatched)
 	} else {
 		exit, err = tunnel.NewPoolExitNode(exitMode)
 	}

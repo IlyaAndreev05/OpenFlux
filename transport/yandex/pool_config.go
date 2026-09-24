@@ -5,16 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 const (
-	MaxPoolDocuments = 50
-	MaxPoolClients   = 1000
+	MaxPoolDocuments     = 50
+	MaxPoolClients       = 1000
+	MaxPoolForwardRoutes = 256
 )
 
 type PoolDocument struct {
@@ -27,11 +30,19 @@ type PoolClientKey struct {
 	KeyFile string `json:"key_file"`
 }
 
-// PoolForwardRoute restricts a pool exit to one virtual TCP endpoint and
-// rewrites it to a loopback service on the exit host.
+// PoolForwardRoute maps a virtual IPv4 TCP endpoint to a TCP destination.
 type PoolForwardRoute struct {
 	VirtualEndpoint string `json:"virtual_endpoint"`
 	Target          string `json:"target"`
+}
+
+// PoolForwardConfig optionally applies exact destination routes on an L4
+// pool exit. The singular fields remain supported for existing configs.
+type PoolForwardConfig struct {
+	VirtualEndpoint string             `json:"virtual_endpoint,omitempty"`
+	Target          string             `json:"target,omitempty"`
+	Routes          []PoolForwardRoute `json:"routes,omitempty"`
+	Unmatched       string             `json:"unmatched,omitempty"`
 }
 
 // PoolConfig is role-specific after loading: clients contains secrets only on
@@ -43,17 +54,17 @@ type PoolConfig struct {
 	Clients   map[string][32]byte
 	ClientID  string
 	ClientKey [32]byte
-	Forward   *PoolForwardRoute
+	Forward   *PoolForwardConfig
 }
 
 type poolConfigFile struct {
-	PoolID    string            `json:"pool_id"`
-	Strategy  string            `json:"strategy"`
-	Documents []PoolDocument    `json:"documents"`
-	ClientID  string            `json:"client_id,omitempty"`
-	KeyFile   string            `json:"key_file,omitempty"`
-	Clients   []PoolClientKey   `json:"clients,omitempty"`
-	Forward   *PoolForwardRoute `json:"forward,omitempty"`
+	PoolID    string             `json:"pool_id"`
+	Strategy  string             `json:"strategy"`
+	Documents []PoolDocument     `json:"documents"`
+	ClientID  string             `json:"client_id,omitempty"`
+	KeyFile   string             `json:"key_file,omitempty"`
+	Clients   []PoolClientKey    `json:"clients,omitempty"`
+	Forward   *PoolForwardConfig `json:"forward,omitempty"`
 }
 
 func LoadPoolConfig(path, role string) (PoolConfig, error) {
@@ -118,10 +129,26 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 		}
 	case "exit":
 		if raw.Forward != nil {
-			if err := validatePoolForwardRoute(*raw.Forward); err != nil {
+			routes, err := raw.Forward.normalizedRoutes()
+			if err != nil {
 				return PoolConfig{}, fmt.Errorf("forward: %w", err)
 			}
-			cfg.Forward = raw.Forward
+			policy := strings.TrimSpace(raw.Forward.Unmatched)
+			if policy == "" {
+				policy = "deny"
+			}
+			if policy != "deny" && policy != "direct" {
+				return PoolConfig{}, fmt.Errorf("forward.unmatched must be deny or direct")
+			}
+			if err := validatePoolForwardRoutes(routes); err != nil {
+				return PoolConfig{}, fmt.Errorf("forward: %w", err)
+			}
+			cfg.Forward = &PoolForwardConfig{
+				VirtualEndpoint: strings.TrimSpace(raw.Forward.VirtualEndpoint),
+				Target:          strings.TrimSpace(raw.Forward.Target),
+				Routes:          routes,
+				Unmatched:       policy,
+			}
 		}
 		if len(raw.Clients) == 0 || len(raw.Clients) > MaxPoolClients {
 			return PoolConfig{}, fmt.Errorf("clients must contain 1 to %d entries", MaxPoolClients)
@@ -161,14 +188,50 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 	return cfg, nil
 }
 
-func validatePoolForwardRoute(route PoolForwardRoute) error {
-	virtual, err := netip.ParseAddrPort(strings.TrimSpace(route.VirtualEndpoint))
-	if err != nil || !virtual.Addr().Is4() || virtual.Addr().IsLoopback() || virtual.Port() == 0 {
-		return errors.New("virtual_endpoint must be a non-loopback IPv4 address and port")
+func (f PoolForwardConfig) normalizedRoutes() ([]PoolForwardRoute, error) {
+	routes := append([]PoolForwardRoute(nil), f.Routes...)
+	if len(routes) != 0 {
+		if strings.TrimSpace(f.VirtualEndpoint) != "" || strings.TrimSpace(f.Target) != "" {
+			return nil, errors.New("use either routes or the legacy virtual_endpoint/target fields")
+		}
+		return routes, nil
 	}
-	target, err := netip.ParseAddrPort(strings.TrimSpace(route.Target))
-	if err != nil || !target.Addr().Is4() || !target.Addr().IsLoopback() || target.Port() == 0 {
-		return errors.New("target must be a loopback IPv4 address and port")
+	virtual, target := strings.TrimSpace(f.VirtualEndpoint), strings.TrimSpace(f.Target)
+	if virtual == "" || target == "" {
+		return nil, errors.New("configure routes or both virtual_endpoint and target")
+	}
+	return []PoolForwardRoute{{VirtualEndpoint: virtual, Target: target}}, nil
+}
+
+func validatePoolForwardRoutes(routes []PoolForwardRoute) error {
+	if len(routes) == 0 || len(routes) > MaxPoolForwardRoutes {
+		return fmt.Errorf("routes must contain 1 to %d entries", MaxPoolForwardRoutes)
+	}
+	seen := make(map[netip.AddrPort]bool, len(routes))
+	for i, route := range routes {
+		virtual, err := netip.ParseAddrPort(strings.TrimSpace(route.VirtualEndpoint))
+		if err != nil || !virtual.Addr().Is4() || virtual.Port() == 0 {
+			return fmt.Errorf("routes[%d].virtual_endpoint must be an IPv4 address and port", i)
+		}
+		if seen[virtual] {
+			return fmt.Errorf("routes[%d].virtual_endpoint duplicates %q", i, virtual)
+		}
+		seen[virtual] = true
+		if err := validatePoolForwardTarget(route.Target); err != nil {
+			return fmt.Errorf("routes[%d].target: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func validatePoolForwardTarget(value string) error {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(value))
+	if err != nil || host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "\x00\r\n/?#") {
+		return errors.New("must be a host:port TCP destination")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("port must be between 1 and 65535")
 	}
 	return nil
 }
