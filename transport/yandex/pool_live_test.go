@@ -25,6 +25,9 @@ func TestLivePoolFailoverPreservesTCP(t *testing.T) {
 		envOr("OPENFLUX_POOL_DOC1", ""),
 		envOr("OPENFLUX_POOL_DOC2", ""),
 	}
+	if urls[0] == "" || urls[1] == "" {
+		t.Fatal("set OPENFLUX_POOL_DOC1 and OPENFLUX_POOL_DOC2 explicitly for live tests")
+	}
 	bindIP := envOr("OPENFLUX_POOL_TEST_BIND_IP", "172.17.0.1")
 	listener, err := net.Listen("tcp", net.JoinHostPort(bindIP, "0"))
 	if err != nil {

@@ -28,8 +28,9 @@ Run from any directory:
 XRAY_BIN=/path/to/xray ./examples/xray/run-local.sh
 ```
 
-By default the runner uses the two document URLs in the test plan. Override
-`OPENFLUX_POOL_DOC1` and `OPENFLUX_POOL_DOC2` to use other documents. It builds
+Live runs require `OPENFLUX_POOL_DOC1` and `OPENFLUX_POOL_DOC2` to be set
+explicitly to documents you control. No document URLs are bundled. The
+in-memory test does not require these variables. It builds
 OpenFlux from the current checkout when `OPENFLUX_BIN` is unset. Random pool
 keys, UUIDs, and a short-lived self-signed certificate are created under a
 private temporary directory for each run; the Xray test clients trust that

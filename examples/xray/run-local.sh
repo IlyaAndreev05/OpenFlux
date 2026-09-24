@@ -7,6 +7,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DOC1="${OPENFLUX_POOL_DOC1:-}"
 DOC2="${OPENFLUX_POOL_DOC2:-}"
+if [[ "${OPENFLUX_TEST_TRANSPORT:-yandex}" != "memory" && ( -z "$DOC1" || -z "$DOC2" ) ]]; then
+  echo "Set OPENFLUX_POOL_DOC1 and OPENFLUX_POOL_DOC2 explicitly for live tests." >&2
+  exit 2
+fi
 XRAY_BIN="${XRAY_BIN:-$(command -v xray || true)}"
 OPENFLUX_BIN="${OPENFLUX_BIN:-}"
 INGRESS_MODE="${OPENFLUX_CLIENT_INGRESS:-socks5}"
