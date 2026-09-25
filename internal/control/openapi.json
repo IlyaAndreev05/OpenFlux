@@ -1,0 +1,847 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "OpenFlux Control API",
+    "version": "1.0.0",
+    "description": "Versioned control plane API. Web and CLI use the same endpoints."
+  },
+  "servers": [
+    {
+      "url": "https://control.example.invalid",
+      "description": "Replace with deployment URL"
+    }
+  ],
+  "security": [
+    {
+      "AdminBearer": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "AdminBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "NodeBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Per-node token issued once when the node is created"
+      }
+    },
+    "schemas": {
+      "UserCreate": {
+        "type": "object",
+        "required": [
+          "username"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 128
+          }
+        }
+      },
+      "DocumentCreate": {
+        "type": "object",
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      },
+      "PoolCreate": {
+        "type": "object",
+        "required": [
+          "name",
+          "document_ids"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "strategy": {
+            "type": "string",
+            "enum": [
+              "least-loaded",
+              "round-robin",
+              "sticky"
+            ]
+          },
+          "document_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "standalone",
+              "transport"
+            ],
+            "default": "standalone"
+          },
+          "tcp_endpoint": {
+            "type": "string",
+            "description": "IPv4 host:port reachable through the client-side TCP listener"
+          },
+          "forward_target": {
+            "type": "string",
+            "description": "Internal Xray TCP inbound host:port, sent only to exit nodes"
+          }
+        }
+      },
+      "NodeCreate": {
+        "type": "object",
+        "required": [
+          "name",
+          "role",
+          "address"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "exit",
+              "transport"
+            ]
+          },
+          "address": {
+            "type": "string"
+          }
+        }
+      },
+      "DeviceRegister": {
+        "type": "object",
+        "required": [
+          "subscription_token",
+          "name"
+        ],
+        "properties": {
+          "subscription_token": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "platform": {
+            "type": "string"
+          },
+          "device_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "string",
+            "writeOnly": true,
+            "minLength": 64,
+            "maxLength": 64
+          }
+        }
+      },
+      "NodeAck": {
+        "type": "object",
+        "required": [
+          "version",
+          "error"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "error": {
+            "type": "string",
+            "maxLength": 2048
+          }
+        }
+      },
+      "RemnawaveSettings": {
+        "type": "object",
+        "required": [
+          "base_url",
+          "api_version",
+          "selected_squads",
+          "enabled"
+        ],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "api_version": {
+            "type": "string",
+            "enum": [
+              "v2",
+              "v3"
+            ]
+          },
+          "token": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "webhook_secret": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "selected_squads": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SquadPoolMappings": {
+        "type": "object",
+        "required": [
+          "mappings"
+        ],
+        "properties": {
+          "mappings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "squad_uuid",
+                "pool_id"
+              ],
+              "properties": {
+                "squad_uuid": {
+                  "type": "string"
+                },
+                "pool_id": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "Healthy"
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "summary": "OpenAPI specification",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 document"
+          }
+        },
+        "security": []
+      }
+    },
+    "/s/{token}": {
+      "get": {
+        "summary": "Get subscription profile",
+        "responses": {
+          "200": {
+            "description": "Profile"
+          },
+          "404": {
+            "description": "Revoked or missing"
+          },
+          "410": {
+            "description": "Disabled"
+          }
+        },
+        "security": [],
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/v1/device/register": {
+      "post": {
+        "summary": "Register or refresh device",
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "200": {
+            "description": "Existing device refreshed"
+          },
+          "403": {
+            "description": "Subscription or device credentials revoked"
+          }
+        },
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceRegister"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users": {
+      "get": {
+        "summary": "List users",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create users",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserCreate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get user",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update local user",
+        "responses": {
+          "200": {
+            "description": "Updated"
+          },
+          "403": {
+            "description": "Remnawave owns this user"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete local user",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/api/v1/users/{id}/devices": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "List user devices",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/users/{id}/subscription": {
+      "post": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Issue or rotate subscription token",
+        "responses": {
+          "201": {
+            "description": "URL and QR, shown once"
+          }
+        },
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{id}/config": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Export one-device configuration; creates a device record",
+        "responses": {
+          "200": {
+            "description": "Returns per-device client_configs, a subscription_url and a QR PNG containing the per-device client configuration. If the config is too large, qr_error explains that the JSON file must be imported instead."
+          }
+        }
+      }
+    },
+    "/api/v1/devices/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Revoke device",
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          }
+        }
+      }
+    },
+    "/api/v1/devices/{id}/rotate": {
+      "post": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Rotate device credential",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/documents": {
+      "get": {
+        "summary": "List documents",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create documents",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentCreate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/documents/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get document",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update document",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete document",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/api/v1/pools": {
+      "get": {
+        "summary": "List pools",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create pools",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PoolCreate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/pools/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get pool",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update pool",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete pool",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/api/v1/nodes": {
+      "get": {
+        "summary": "List nodes",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create nodes",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeCreate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/nodes/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get node status",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update node",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete node",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/api/v1/nodes/{id}/config": {
+      "get": {
+        "security": [
+          {
+            "NodeBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "summary": "Fetch versioned node config",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/nodes/{id}/ack": {
+      "post": {
+        "security": [
+          {
+            "NodeBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeAck"
+              }
+            }
+          }
+        },
+        "summary": "Acknowledge application result",
+        "responses": {
+          "200": {
+            "description": "Failure preserves prior applied version"
+          }
+        }
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "summary": "List administrative audit events",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/remnawave": {
+      "get": {
+        "summary": "Get Remnawave integration status",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemnawaveSettings"
+              }
+            }
+          }
+        },
+        "summary": "Configure Remnawave API and selected Internal Squads",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/remnawave/squad-pools": {
+      "get": {
+        "summary": "List squad to pool mappings",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "put": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SquadPoolMappings"
+              }
+            }
+          }
+        },
+        "summary": "Replace squad to pool mappings",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/remnawave/sync": {
+      "post": {
+        "summary": "Run full Remnawave reconciliation",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/remnawave/webhook": {
+      "post": {
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Duplicate event ignored"
+          },
+          "200": {
+            "description": "Webhook handled"
+          },
+          "401": {
+            "description": "Signature invalid"
+          }
+        }
+      }
+    }
+  }
+}

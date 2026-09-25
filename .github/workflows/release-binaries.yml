@@ -1,0 +1,94 @@
+name: Build core binaries
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      OPENFLUX_TEST_POSTGRES_DSN: postgres://openflux_test:test-password@127.0.0.1:5432/openflux_test?sslmode=disable
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_DB: openflux_test
+          POSTGRES_USER: openflux_test
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openflux_test -d openflux_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            asset: openflux-linux-amd64
+          - goos: linux
+            goarch: arm64
+            asset: openflux-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            asset: openflux-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            asset: openflux-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            asset: openflux-windows-amd64.exe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags='-s -w' -o 'dist/${{ matrix.asset }}' .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+      - name: Create SHA256 manifest
+        run: cd dist && sha256sum openflux-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

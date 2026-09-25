@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openflux
+      POSTGRES_USER: openflux
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - openflux-postgres:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openflux -d openflux"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  openflux-control:
+    environment:
+      OPENFLUX_DB_DRIVER: postgres
+      OPENFLUX_DATABASE_URL: postgres://openflux:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/openflux?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - openflux-data:/data
+      - ${OPENFLUX_BACKUP_DIR:-./backups}:/backup
+
+volumes:
+  openflux-postgres:

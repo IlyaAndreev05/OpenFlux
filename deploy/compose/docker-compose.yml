@@ -1,0 +1,144 @@
+name: openflux
+services:
+  traefik:
+    image: traefik:v3.7.13
+    restart: unless-stopped
+    command:
+      - --api.dashboard=false
+      - --ping=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=openflux-edge
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL:?set ACME_EMAIL in .env}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - openflux-acme:/letsencrypt
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  openflux-control:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.control
+    image: openflux-control:local
+    restart: unless-stopped
+    environment:
+      OPENFLUX_DB_DRIVER: sqlite
+      OPENFLUX_SQLITE_PATH: /data/openflux-control.db
+      OPENFLUX_INSTALLATION_KEY_FILE: /data/installation.key
+      OPENFLUX_ADMIN_TOKEN: ${OPENFLUX_ADMIN_TOKEN:?set OPENFLUX_ADMIN_TOKEN in .env}
+      OPENFLUX_PUBLIC_URL: https://${OPENFLUX_DOMAIN:?set OPENFLUX_DOMAIN in .env}
+      OPENFLUX_CONTROL_ADDR: :8787
+    volumes:
+      - openflux-data:/data
+      - ${OPENFLUX_BACKUP_DIR:-./backups}:/backup
+    expose: ["8787"]
+    networks: [edge, backend]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=openflux-edge
+      - traefik.http.routers.openflux-control.rule=Host(`${OPENFLUX_DOMAIN}`) && (PathPrefix(`/api/v1`) || PathPrefix(`/s/`) || Path(`/healthz`))
+      - traefik.http.routers.openflux-control.entrypoints=websecure
+      - traefik.http.routers.openflux-control.tls.certresolver=le
+      - traefik.http.routers.openflux-control.priority=100
+      - traefik.http.services.openflux-control.loadbalancer.server.port=8787
+      - traefik.http.routers.openflux-control.middlewares=openflux-headers
+      - traefik.http.middlewares.openflux-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.openflux-headers.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.openflux-headers.headers.contentTypeNosniff=true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8787/healthz >/dev/null"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    security_opt: ["no-new-privileges:true"]
+
+  openflux-node:
+    profiles: ["local-node"]
+    build:
+      context: ../..
+      dockerfile: Dockerfile.node
+    image: openflux-node:local
+    restart: unless-stopped
+    environment:
+      OPENFLUX_CONTROL_URL: http://openflux-control:8787
+      OPENFLUX_NODE_ID: ${OPENFLUX_NODE_ID:-}
+      OPENFLUX_NODE_TOKEN: ${OPENFLUX_NODE_TOKEN:-}
+      OPENFLUX_EXIT_MODE: ${OPENFLUX_EXIT_MODE:-l4}
+      OPENFLUX_CODEC: batched
+      OPENFLUX_NODE_STATE_DIR: /var/lib/openflux
+      OPENFLUX_NODE_HEALTH_ADDR: 127.0.0.1:8790
+    volumes:
+      - openflux-node-state:/var/lib/openflux
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      openflux-control:
+        condition: service_healthy
+    networks: [edge, backend]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8790/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+
+  openflux-panel:
+    build:
+      context: ../../../OpenFlux-admin-panel
+      dockerfile: Dockerfile
+    image: openflux-admin-panel:local
+    restart: unless-stopped
+    environment:
+      CONTROL_API_URL: http://openflux-control:8787
+      OPENFLUX_ADMIN_TOKEN: ${OPENFLUX_ADMIN_TOKEN:?set OPENFLUX_ADMIN_TOKEN in .env}
+      OPENFLUX_PANEL_PASSWORD: ${OPENFLUX_PANEL_PASSWORD:?set OPENFLUX_PANEL_PASSWORD in .env}
+    expose: ["3000"]
+    depends_on:
+      openflux-control:
+        condition: service_healthy
+    networks: [edge, backend]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=openflux-edge
+      - traefik.http.routers.openflux-panel.rule=Host(`${OPENFLUX_DOMAIN}`)
+      - traefik.http.routers.openflux-panel.entrypoints=websecure
+      - traefik.http.routers.openflux-panel.tls.certresolver=le
+      - traefik.http.routers.openflux-panel.priority=1
+      - traefik.http.services.openflux-panel.loadbalancer.server.port=3000
+      - traefik.http.routers.openflux-panel.middlewares=openflux-panel-headers
+      - traefik.http.middlewares.openflux-panel-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.openflux-panel-headers.headers.contentTypeNosniff=true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  openflux-data:
+  openflux-node-state:
+  openflux-acme:
+networks:
+  edge:
+    name: openflux-edge
+  backend:
+    name: openflux-backend
+    internal: true

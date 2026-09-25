@@ -36,19 +36,20 @@ type YandexDocsPoolClient struct {
 	activeID string
 	epoch    uint64
 
-	assignCh chan controlResult
-	readyCh  chan controlResult
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
-	lifeMu   sync.Mutex
-	started  bool
-	stopped  bool
-	lastAck  atomic.Int64
+	assignCh      chan controlResult
+	readyCh       chan controlResult
+	stopCh        chan struct{}
+	stopOnce      sync.Once
+	wg            sync.WaitGroup
+	lifeMu        sync.Mutex
+	started       bool
+	stopped       bool
+	lastAck       atomic.Int64
+	pingChallenge [16]byte
 }
 
 func NewYandexDocsPoolClient(cfg PoolConfig, tc transport.TransportConfig) (*YandexDocsPoolClient, error) {
-	cipher, err := newPoolCipher(cfg.ClientKey, poolDomain(cfg), cfg.ClientID, false)
+	cipher, err := newPoolCipherVersion(cfg.ClientKey, poolDomain(cfg), cfg.ClientID, false, effectivePoolVersion(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +101,10 @@ func (c *YandexDocsPoolClient) Stop() error {
 	raw := c.rawDocs[docID]
 	c.mu.RUnlock()
 	if raw != nil {
-		closeFrame := poolFrame{Kind: poolClose, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: epoch, DocID: docID}
+		closeFrame := poolFrame{Version: effectivePoolVersion(c.cfg), Kind: poolClose, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: epoch, DocID: docID}
+		if closeFrame.Version == poolProtocolCurrent {
+			_, _ = rand.Read(closeFrame.Challenge[:])
+		}
 		closeFrame.Payload = poolProof(c.cfg.ClientKey, c.domain, closeFrame)
 		if encoded, err := encodePoolFrame(closeFrame); err == nil {
 			_ = raw.Send(encoded)
@@ -121,11 +125,12 @@ func (c *YandexDocsPoolClient) Send(data []byte) error {
 	c.mu.RLock()
 	docID, epoch := c.activeID, c.epoch
 	raw := c.rawDocs[docID]
+	cipher := c.cipher
 	c.mu.RUnlock()
-	if raw == nil || !raw.IsConnected() {
+	if raw == nil || !raw.IsConnected() || cipher == nil {
 		return errors.New("assigned Yandex document is disconnected")
 	}
-	f, err := c.cipher.seal(poolFrame{Kind: poolData, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: epoch, DocID: docID}, data)
+	f, err := cipher.seal(poolFrame{Kind: poolData, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: epoch, DocID: docID}, data)
 	if err != nil {
 		return err
 	}
@@ -184,13 +189,22 @@ func (c *YandexDocsPoolClient) establish(bootstrap string) error {
 		return fmt.Errorf("document %q did not connect", bootstrap)
 	}
 
-	hello := poolFrame{Kind: poolHello, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, DocID: bootstrap}
+	hello := poolFrame{Version: effectivePoolVersion(c.cfg), Kind: poolHello, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, DocID: bootstrap}
+	if hello.Version == poolProtocolCurrent {
+		if _, err := rand.Read(hello.Challenge[:]); err != nil {
+			return fmt.Errorf("create pool handshake challenge: %w", err)
+		}
+	}
 	hello.Payload = poolProof(c.cfg.ClientKey, c.domain, hello)
 	assign, err := c.sendUntilControl(raw, hello, c.assignCh, bootstrap, 0, "")
 	if err != nil {
 		return err
 	}
 	target := assign.frame.DocID
+	pendingCipher, err := newPoolSessionCipher(c.cfg.ClientKey, c.domain, c.cfg.ClientID, false, assign.frame.Version, c.sessionID, assign.frame.Epoch)
+	if err != nil {
+		return fmt.Errorf("derive pool session keys: %w", err)
+	}
 	if c.docIndex(target) < 0 {
 		return fmt.Errorf("exit assigned unknown document %q", target)
 	}
@@ -204,7 +218,7 @@ func (c *YandexDocsPoolClient) establish(bootstrap string) error {
 			return fmt.Errorf("assigned document %q did not connect", target)
 		}
 	}
-	bind := poolFrame{Kind: poolBind, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: assign.frame.Epoch, DocID: target}
+	bind := poolFrame{Version: assign.frame.Version, Kind: poolBind, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: assign.frame.Epoch, Challenge: assign.frame.Challenge, DocID: target}
 	bind.Payload = poolProof(c.cfg.ClientKey, c.domain, bind)
 	if _, err := c.sendUntilControl(targetRaw, bind, c.readyCh, target, assign.frame.Epoch, target); err != nil {
 		return err
@@ -216,6 +230,7 @@ func (c *YandexDocsPoolClient) establish(bootstrap string) error {
 	c.mu.Lock()
 	c.activeID = target
 	c.epoch = assign.frame.Epoch
+	c.cipher = pendingCipher
 	c.mu.Unlock()
 	c.lastAck.Store(time.Now().UnixNano())
 	c.SetConnected(true)
@@ -247,6 +262,9 @@ func (c *YandexDocsPoolClient) sendUntilControl(raw *YandexDocsTransport, frame 
 			if docID != "" && result.frame.DocID != docID {
 				continue
 			}
+			if frame.Version == poolProtocolCurrent && result.frame.Challenge != frame.Challenge {
+				continue
+			}
 			if !verifyPoolProof(c.cfg.ClientKey, c.domain, result.frame) {
 				continue
 			}
@@ -276,7 +294,15 @@ func (c *YandexDocsPoolClient) runActive() bool {
 			if raw == nil || !raw.IsConnected() || time.Since(time.Unix(0, c.lastAck.Load())) >= poolHeartbeatTimeout {
 				return true
 			}
-			ping := poolFrame{Kind: poolPing, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: epoch, DocID: docID}
+			ping := poolFrame{Version: effectivePoolVersion(c.cfg), Kind: poolPing, Direction: 0, ClientID: c.cfg.ClientID, SessionID: c.sessionID, Epoch: epoch, DocID: docID}
+			if ping.Version == poolProtocolCurrent {
+				if _, err := rand.Read(ping.Challenge[:]); err != nil {
+					return true
+				}
+				c.mu.Lock()
+				c.pingChallenge = ping.Challenge
+				c.mu.Unlock()
+			}
 			ping.Payload = poolProof(c.cfg.ClientKey, c.domain, ping)
 			encoded, err := encodePoolFrame(ping)
 			if err != nil || raw.Send(encoded) != nil {
@@ -321,7 +347,7 @@ func (c *YandexDocsPoolClient) startRaw(docID string) (*YandexDocsTransport, err
 
 func (c *YandexDocsPoolClient) handleRawData(source string, data []byte) {
 	f, err := decodePoolFrame(data)
-	if err != nil || f.ClientID != c.cfg.ClientID || f.SessionID != c.sessionID || f.Direction != 1 {
+	if err != nil || f.ClientID != c.cfg.ClientID || f.SessionID != c.sessionID || f.Direction != 1 || f.Version != effectivePoolVersion(c.cfg) {
 		return
 	}
 	switch f.Kind {
@@ -341,6 +367,9 @@ func (c *YandexDocsPoolClient) handleRawData(source string, data []byte) {
 		}
 		c.mu.RLock()
 		matches := source == c.activeID && f.DocID == c.activeID && f.Epoch == c.epoch
+		if f.Version == poolProtocolCurrent {
+			matches = matches && f.Challenge == c.pingChallenge
+		}
 		c.mu.RUnlock()
 		if matches {
 			c.lastAck.Store(time.Now().UnixNano())
@@ -352,7 +381,13 @@ func (c *YandexDocsPoolClient) handleRawData(source string, data []byte) {
 		if !matches {
 			return
 		}
-		plain, err := c.cipher.open(f)
+		c.mu.RLock()
+		cipher := c.cipher
+		c.mu.RUnlock()
+		if cipher == nil {
+			return
+		}
+		plain, err := cipher.open(f)
 		if err != nil {
 			return
 		}

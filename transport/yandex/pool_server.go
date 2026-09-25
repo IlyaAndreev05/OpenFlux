@@ -1,6 +1,8 @@
 package yandex
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -57,6 +59,13 @@ type PoolSession struct {
 	pendingEpoch     uint64
 	pendingDoc       string
 	pendingBootstrap string
+	pendingChallenge [16]byte
+	pendingCipher    *poolCipher
+	announced        bool
+	helloSeen        map[[16]byte]struct{}
+	helloFIFO        [][16]byte
+	pingSeen         map[[16]byte]struct{}
+	pingFIFO         [][16]byte
 	lastSeen         time.Time
 }
 
@@ -115,7 +124,10 @@ func (s *YandexDocsPoolServer) Stop() error {
 	for _, session := range sessions {
 		session.SetConnected(false)
 		_ = session.BaseTransport.Stop()
-		if s.onRemove != nil {
+		session.mu.RLock()
+		announced := session.announced
+		session.mu.RUnlock()
+		if announced && s.onRemove != nil {
 			s.onRemove(session.clientID)
 		}
 	}
@@ -130,7 +142,7 @@ func (s *YandexDocsPoolServer) handleDocData(docID string, data []byte) {
 		return
 	}
 	f, err := decodePoolFrame(data)
-	if err != nil || f.Direction != 0 {
+	if err != nil || f.Direction != 0 || f.Version != effectivePoolVersion(s.cfg) {
 		return
 	}
 	switch f.Kind {
@@ -149,12 +161,15 @@ func (s *YandexDocsPoolServer) handleDocData(docID string, data []byte) {
 
 func (s *YandexDocsPoolServer) handleHello(bootstrap string, f poolFrame) {
 	key, ok := s.cfg.Clients[f.ClientID]
-	if !ok || f.DocID != bootstrap || !verifyPoolProof(key, s.domain, f) {
+	if !ok || f.Version != effectivePoolVersion(s.cfg) || f.DocID != bootstrap || !verifyPoolProof(key, s.domain, f) {
+		return
+	}
+	if f.Version == poolProtocolCurrent && f.Challenge == [16]byte{} {
 		return
 	}
 
 	var replaced *PoolSession
-	var created bool
+	var replacedAnnounced bool
 	s.mu.Lock()
 	if !s.running.Load() {
 		s.mu.Unlock()
@@ -162,7 +177,16 @@ func (s *YandexDocsPoolServer) handleHello(bootstrap string, f poolFrame) {
 	}
 	session := s.sessions[f.ClientID]
 	if session != nil && session.sessionID != f.SessionID {
-		replaced = session
+		session.mu.RLock()
+		last, active, docID, announced := session.lastSeen, session.active, session.docID, session.announced
+		session.mu.RUnlock()
+		raw := s.docs[docID]
+		if active && time.Since(last) <= poolSessionTimeout && raw != nil && raw.IsConnected() {
+			// A valid but stale HELLO must never evict a live session.
+			s.mu.Unlock()
+			return
+		}
+		replaced, replacedAnnounced = session, announced
 		delete(s.sessions, f.ClientID)
 		session = nil
 	}
@@ -171,55 +195,92 @@ func (s *YandexDocsPoolServer) handleHello(bootstrap string, f poolFrame) {
 			s.mu.Unlock()
 			return
 		}
-		cipher, err := newPoolCipher(key, s.domain, f.ClientID, true)
-		if err != nil {
-			s.mu.Unlock()
-			return
-		}
 		session = &PoolSession{
 			BaseTransport: transport.NewBaseTransport(s.transport),
-			server:        s, clientID: f.ClientID, sessionID: f.SessionID, key: key, cipher: cipher,
-			lastSeen: time.Now(),
+			server:        s, clientID: f.ClientID, sessionID: f.SessionID, key: key,
+			helloSeen: make(map[[16]byte]struct{}), pingSeen: make(map[[16]byte]struct{}),
 		}
 		s.sessions[f.ClientID] = session
-		created = true
 	}
+
 	session.mu.Lock()
-	session.lastSeen = time.Now()
-	needsAssignment := session.pendingBootstrap != bootstrap || session.pendingEpoch == 0
+	needTarget := false
+	if f.Version == poolProtocolCurrent {
+		if f.Challenge != session.pendingChallenge {
+			if _, replay := session.helloSeen[f.Challenge]; replay {
+				session.mu.Unlock()
+				s.mu.Unlock()
+				return
+			}
+			session.helloSeen[f.Challenge] = struct{}{}
+			session.helloFIFO = append(session.helloFIFO, f.Challenge)
+			if len(session.helloFIFO) > poolReplayLimit {
+				old := session.helloFIFO[0]
+				session.helloFIFO = session.helloFIFO[1:]
+				delete(session.helloSeen, old)
+			}
+			var epochBytes [8]byte
+			if _, err := rand.Read(epochBytes[:]); err != nil {
+				session.mu.Unlock()
+				s.mu.Unlock()
+				return
+			}
+			epoch := binary.BigEndian.Uint64(epochBytes[:])
+			if epoch == 0 || epoch == session.epoch {
+				epoch++
+			}
+			cipher, err := newPoolSessionCipher(key, s.domain, f.ClientID, true, f.Version, f.SessionID, epoch)
+			if err != nil {
+				session.mu.Unlock()
+				s.mu.Unlock()
+				return
+			}
+			session.pendingEpoch = epoch
+			session.pendingDoc = ""
+			session.pendingBootstrap = bootstrap
+			session.pendingChallenge = f.Challenge
+			session.pendingCipher = cipher
+			needTarget = true
+		}
+	} else if session.pendingBootstrap != bootstrap || session.pendingEpoch == 0 {
+		session.pendingDoc = ""
+		session.pendingBootstrap = bootstrap
+		session.pendingEpoch = session.epoch + 1
+		if session.pendingEpoch == 0 {
+			session.pendingEpoch = 1
+		}
+		session.pendingChallenge = [16]byte{}
+		session.pendingCipher = nil
+		needTarget = true
+	}
+	epoch := session.pendingEpoch
+	challenge := session.pendingChallenge
 	session.mu.Unlock()
-	if needsAssignment {
+
+	if needTarget {
 		target := s.chooseDocLocked(f.ClientID, bootstrap)
 		if target == "" {
 			target = bootstrap
 		}
 		session.mu.Lock()
-		if session.pendingBootstrap != bootstrap || session.pendingEpoch == 0 {
-			session.pendingEpoch = session.epoch + 1
+		if session.pendingEpoch == epoch && session.pendingChallenge == challenge {
 			session.pendingDoc = target
-			session.pendingBootstrap = bootstrap
 		}
 		session.mu.Unlock()
 	}
 	session.mu.RLock()
-	epoch, target := session.pendingEpoch, session.pendingDoc
+	epoch, target, challenge := session.pendingEpoch, session.pendingDoc, session.pendingChallenge
 	session.mu.RUnlock()
 	s.mu.Unlock()
 
 	if replaced != nil {
-		_ = replaced.BaseTransport.Stop()
 		replaced.SetConnected(false)
-		if s.onRemove != nil {
+		_ = replaced.BaseTransport.Stop()
+		if replacedAnnounced && s.onRemove != nil {
 			s.onRemove(replaced.clientID)
 		}
 	}
-	if created {
-		_ = session.BaseTransport.Start()
-		if s.onClient != nil {
-			s.onClient(session)
-		}
-	}
-	reply := poolFrame{Kind: poolAssign, Direction: 1, ClientID: f.ClientID, SessionID: f.SessionID, Epoch: epoch, DocID: target}
+	reply := poolFrame{Version: f.Version, Kind: poolAssign, Direction: 1, ClientID: f.ClientID, SessionID: f.SessionID, Epoch: epoch, Challenge: challenge, DocID: target}
 	reply.Payload = poolProof(key, s.domain, reply)
 	s.sendControl(bootstrap, reply)
 }
@@ -232,22 +293,36 @@ func (s *YandexDocsPoolServer) handleBind(docID string, f poolFrame) {
 		return
 	}
 	session.mu.Lock()
-	if f.Epoch != session.pendingEpoch || f.DocID != session.pendingDoc || docID != session.pendingDoc {
+	if f.Epoch != session.pendingEpoch || f.DocID != session.pendingDoc || docID != session.pendingDoc ||
+		(f.Version == poolProtocolCurrent && (f.Challenge != session.pendingChallenge || session.pendingCipher == nil)) {
 		session.mu.Unlock()
 		return
 	}
+	firstBind := !session.announced
 	session.epoch = session.pendingEpoch
 	session.docID = session.pendingDoc
 	session.active = true
+	if f.Version == poolProtocolCurrent {
+		session.cipher = session.pendingCipher
+	}
 	session.pendingEpoch = 0
 	session.pendingDoc = ""
 	session.pendingBootstrap = ""
+	session.pendingChallenge = [16]byte{}
+	session.pendingCipher = nil
 	session.lastSeen = time.Now()
+	session.announced = true
 	session.SetConnected(true)
 	session.mu.Unlock()
 
+	if firstBind {
+		_ = session.BaseTransport.Start()
+		if s.onClient != nil {
+			s.onClient(session)
+		}
+	}
 	utils.Debugf("[POOL] client %s assigned document %s (epoch %d)", f.ClientID, docID, f.Epoch)
-	reply := poolFrame{Kind: poolReady, Direction: 1, ClientID: f.ClientID, SessionID: f.SessionID, Epoch: f.Epoch, DocID: docID}
+	reply := poolFrame{Version: f.Version, Kind: poolReady, Direction: 1, ClientID: f.ClientID, SessionID: f.SessionID, Epoch: f.Epoch, Challenge: f.Challenge, DocID: docID}
 	reply.Payload = poolProof(session.key, s.domain, reply)
 	s.sendControl(docID, reply)
 }
@@ -256,7 +331,7 @@ func (s *YandexDocsPoolServer) handlePing(docID string, f poolFrame) {
 	s.mu.RLock()
 	session := s.sessions[f.ClientID]
 	s.mu.RUnlock()
-	if session == nil || session.sessionID != f.SessionID || !verifyPoolProof(session.key, s.domain, f) {
+	if session == nil || session.sessionID != f.SessionID || f.Version != effectivePoolVersion(s.cfg) || !verifyPoolProof(session.key, s.domain, f) {
 		return
 	}
 	session.mu.Lock()
@@ -264,9 +339,26 @@ func (s *YandexDocsPoolServer) handlePing(docID string, f poolFrame) {
 		session.mu.Unlock()
 		return
 	}
+	if f.Version == poolProtocolCurrent {
+		if f.Challenge == [16]byte{} {
+			session.mu.Unlock()
+			return
+		}
+		if _, replay := session.pingSeen[f.Challenge]; replay {
+			session.mu.Unlock()
+			return
+		}
+		session.pingSeen[f.Challenge] = struct{}{}
+		session.pingFIFO = append(session.pingFIFO, f.Challenge)
+		if len(session.pingFIFO) > poolReplayLimit {
+			old := session.pingFIFO[0]
+			session.pingFIFO = session.pingFIFO[1:]
+			delete(session.pingSeen, old)
+		}
+	}
 	session.lastSeen = time.Now()
 	session.mu.Unlock()
-	reply := poolFrame{Kind: poolPong, Direction: 1, ClientID: f.ClientID, SessionID: f.SessionID, Epoch: f.Epoch, DocID: docID}
+	reply := poolFrame{Version: f.Version, Kind: poolPong, Direction: 1, ClientID: f.ClientID, SessionID: f.SessionID, Epoch: f.Epoch, Challenge: f.Challenge, DocID: docID}
 	reply.Payload = poolProof(session.key, s.domain, reply)
 	s.sendControl(docID, reply)
 }
@@ -278,17 +370,31 @@ func (s *YandexDocsPoolServer) handleData(docID string, f poolFrame) {
 	if session == nil || session.sessionID != f.SessionID {
 		return
 	}
-	session.mu.Lock()
-	active := session.active && session.epoch == f.Epoch && session.docID == docID
-	if active {
-		session.lastSeen = time.Now()
-	}
-	session.mu.Unlock()
-	if !active {
+	session.mu.RLock()
+	active := session.active && session.epoch == f.Epoch && session.docID == docID && f.Version == effectivePoolVersion(s.cfg)
+	cipher := session.cipher
+	session.mu.RUnlock()
+	if !active || cipher == nil {
 		return
 	}
-	plain, err := session.cipher.open(f)
+	plain, err := cipher.open(f)
 	if err != nil {
+		return
+	}
+	// Activity is refreshed only after authenticated, non-replayed data and
+	// after checking that the same session is still current.
+	s.mu.RLock()
+	current := s.sessions[f.ClientID] == session
+	if current {
+		session.mu.Lock()
+		current = session.active && session.epoch == f.Epoch && session.docID == docID
+		if current {
+			session.lastSeen = time.Now()
+		}
+		session.mu.Unlock()
+	}
+	s.mu.RUnlock()
+	if !current {
 		return
 	}
 	session.RecordReceive(len(plain))
@@ -298,15 +404,36 @@ func (s *YandexDocsPoolServer) handleData(docID string, f poolFrame) {
 func (s *YandexDocsPoolServer) handleClose(f poolFrame) {
 	s.mu.Lock()
 	session := s.sessions[f.ClientID]
-	if session == nil || session.sessionID != f.SessionID || !verifyPoolProof(session.key, s.domain, f) {
+	if session == nil || session.sessionID != f.SessionID || f.Version != effectivePoolVersion(s.cfg) || !verifyPoolProof(session.key, s.domain, f) {
 		s.mu.Unlock()
 		return
 	}
+	session.mu.Lock()
+	if !session.active || f.Epoch != session.epoch || f.DocID != session.docID {
+		session.mu.Unlock()
+		s.mu.Unlock()
+		return
+	}
+	if f.Version == poolProtocolCurrent {
+		if f.Challenge == [16]byte{} {
+			session.mu.Unlock()
+			s.mu.Unlock()
+			return
+		}
+		if _, replay := session.pingSeen[f.Challenge]; replay {
+			session.mu.Unlock()
+			s.mu.Unlock()
+			return
+		}
+		session.pingSeen[f.Challenge] = struct{}{}
+	}
+	announced := session.announced
+	session.mu.Unlock()
 	delete(s.sessions, f.ClientID)
 	s.mu.Unlock()
 	session.SetConnected(false)
 	_ = session.BaseTransport.Stop()
-	if s.onRemove != nil {
+	if announced && s.onRemove != nil {
 		s.onRemove(session.clientID)
 	}
 }
@@ -377,9 +504,12 @@ func (s *YandexDocsPoolServer) sendData(session *PoolSession, data []byte) error
 		session.mu.RUnlock()
 		return errors.New("pool client is not active")
 	}
-	docID, epoch, sid := session.docID, session.epoch, session.sessionID
+	docID, epoch, sid, cipher := session.docID, session.epoch, session.sessionID, session.cipher
 	session.mu.RUnlock()
-	f, err := session.cipher.seal(poolFrame{Kind: poolData, ClientID: session.clientID, SessionID: sid, Epoch: epoch, DocID: docID}, data)
+	if cipher == nil {
+		return errors.New("pool client has no active session cipher")
+	}
+	f, err := cipher.seal(poolFrame{Kind: poolData, ClientID: session.clientID, SessionID: sid, Epoch: epoch, DocID: docID}, data)
 	if err != nil {
 		return err
 	}
@@ -423,7 +553,10 @@ func (s *YandexDocsPoolServer) sweepLoop() {
 			for _, session := range expired {
 				session.SetConnected(false)
 				_ = session.BaseTransport.Stop()
-				if s.onRemove != nil {
+				session.mu.RLock()
+				announced := session.announced
+				session.mu.RUnlock()
+				if announced && s.onRemove != nil {
 					s.onRemove(session.clientID)
 				}
 			}
@@ -461,3 +594,10 @@ func (p *PoolSession) Stop() error {
 }
 
 func (p *PoolSession) Stats() transport.TransportStats { return p.BaseTransport.Stats() }
+
+func effectivePoolVersion(cfg PoolConfig) byte {
+	if cfg.ProtocolVersion == 0 {
+		return poolProtocolCurrent
+	}
+	return cfg.ProtocolVersion
+}

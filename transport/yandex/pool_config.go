@@ -26,8 +26,9 @@ type PoolDocument struct {
 }
 
 type PoolClientKey struct {
-	ID      string `json:"id"`
-	KeyFile string `json:"key_file"`
+	ID        string `json:"id"`
+	KeyFile   string `json:"key_file,omitempty"`
+	ClientKey string `json:"client_key,omitempty"`
 }
 
 // PoolForwardRoute maps a virtual IPv4 TCP endpoint to a TCP destination.
@@ -48,25 +49,28 @@ type PoolForwardConfig struct {
 // PoolConfig is role-specific after loading: clients contains secrets only on
 // an exit node, while clientID/clientKey are populated on a client.
 type PoolConfig struct {
-	PoolID    string
-	Strategy  string
-	Docs      []PoolDocument
-	Clients   map[string][32]byte
-	ClientID  string
-	ClientKey [32]byte
-	TCPTarget string
-	Forward   *PoolForwardConfig
+	ProtocolVersion byte
+	PoolID          string
+	Strategy        string
+	Docs            []PoolDocument
+	Clients         map[string][32]byte
+	ClientID        string
+	ClientKey       [32]byte
+	TCPTarget       string
+	Forward         *PoolForwardConfig
 }
 
 type poolConfigFile struct {
-	PoolID    string             `json:"pool_id"`
-	Strategy  string             `json:"strategy"`
-	Documents []PoolDocument     `json:"documents"`
-	ClientID  string             `json:"client_id,omitempty"`
-	KeyFile   string             `json:"key_file,omitempty"`
-	TCPTarget string             `json:"tcp_target,omitempty"`
-	Clients   []PoolClientKey    `json:"clients,omitempty"`
-	Forward   *PoolForwardConfig `json:"forward,omitempty"`
+	ProtocolVersion byte               `json:"protocol_version,omitempty"`
+	PoolID          string             `json:"pool_id"`
+	Strategy        string             `json:"strategy"`
+	Documents       []PoolDocument     `json:"documents"`
+	ClientID        string             `json:"client_id,omitempty"`
+	KeyFile         string             `json:"key_file,omitempty"`
+	ClientKey       string             `json:"client_key,omitempty"`
+	TCPTarget       string             `json:"tcp_target,omitempty"`
+	Clients         []PoolClientKey    `json:"clients,omitempty"`
+	Forward         *PoolForwardConfig `json:"forward,omitempty"`
 }
 
 func LoadPoolConfig(path, role string) (PoolConfig, error) {
@@ -78,10 +82,18 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return PoolConfig{}, fmt.Errorf("parse pool config: %w", err)
 	}
+	version := raw.ProtocolVersion
+	if version == 0 {
+		version = poolProtocolCurrent
+	}
+	if version != poolProtocolLegacy && version != poolProtocolCurrent {
+		return PoolConfig{}, fmt.Errorf("protocol_version must be %d (legacy) or %d", poolProtocolLegacy, poolProtocolCurrent)
+	}
 	cfg := PoolConfig{
-		PoolID:   strings.TrimSpace(raw.PoolID),
-		Strategy: strings.TrimSpace(raw.Strategy),
-		Docs:     raw.Documents,
+		ProtocolVersion: version,
+		PoolID:          strings.TrimSpace(raw.PoolID),
+		Strategy:        strings.TrimSpace(raw.Strategy),
+		Docs:            raw.Documents,
 	}
 	if cfg.PoolID == "" || len(cfg.PoolID) > 64 || strings.ContainsAny(cfg.PoolID, "\x00\r\n") {
 		return PoolConfig{}, errors.New("pool_id must contain 1 to 64 characters")
@@ -118,8 +130,8 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 		if raw.ClientID == "" || len(raw.ClientID) > 64 || strings.ContainsAny(raw.ClientID, "\x00\r\n") {
 			return PoolConfig{}, errors.New("client_id must contain 1 to 64 characters")
 		}
-		if raw.KeyFile == "" {
-			return PoolConfig{}, errors.New("key_file is required for client role")
+		if (raw.KeyFile == "") == (raw.ClientKey == "") {
+			return PoolConfig{}, errors.New("client role requires exactly one of key_file or client_key")
 		}
 		cfg.ClientID = raw.ClientID
 		if target := strings.TrimSpace(raw.TCPTarget); target != "" {
@@ -128,9 +140,16 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 			}
 			cfg.TCPTarget = target
 		}
-		cfg.ClientKey, err = readPoolKey(filepath.Join(baseDir, raw.KeyFile))
-		if err != nil {
-			return PoolConfig{}, fmt.Errorf("read client key: %w", err)
+		if raw.ClientKey != "" {
+			cfg.ClientKey, err = parsePoolKey(raw.ClientKey)
+			if err != nil {
+				return PoolConfig{}, fmt.Errorf("parse client_key: %w", err)
+			}
+		} else {
+			cfg.ClientKey, err = readPoolKey(filepath.Join(baseDir, raw.KeyFile))
+			if err != nil {
+				return PoolConfig{}, fmt.Errorf("read client key: %w", err)
+			}
 		}
 		if raw.Strategy != "" || len(raw.Clients) != 0 {
 			return PoolConfig{}, errors.New("client pool config must not contain strategy or clients")
@@ -161,8 +180,8 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 				Unmatched:       policy,
 			}
 		}
-		if len(raw.Clients) == 0 || len(raw.Clients) > MaxPoolClients {
-			return PoolConfig{}, fmt.Errorf("clients must contain 1 to %d entries", MaxPoolClients)
+		if len(raw.Clients) > MaxPoolClients {
+			return PoolConfig{}, fmt.Errorf("clients must contain at most %d entries", MaxPoolClients)
 		}
 		if cfg.Strategy == "" {
 			cfg.Strategy = "least-loaded"
@@ -181,17 +200,25 @@ func LoadPoolConfig(path, role string) (PoolConfig, error) {
 			if _, ok := cfg.Clients[c.ID]; ok {
 				return PoolConfig{}, fmt.Errorf("duplicate client id %q", c.ID)
 			}
-			if c.KeyFile == "" {
-				return PoolConfig{}, fmt.Errorf("clients[%d].key_file is required", i)
+			if (c.KeyFile == "") == (c.ClientKey == "") {
+				return PoolConfig{}, fmt.Errorf("clients[%d] requires exactly one of key_file or client_key", i)
 			}
-			key, err := readPoolKey(filepath.Join(baseDir, c.KeyFile))
-			if err != nil {
-				return PoolConfig{}, fmt.Errorf("read key for client %q: %w", c.ID, err)
+			var key [32]byte
+			if c.ClientKey != "" {
+				key, err = parsePoolKey(c.ClientKey)
+				if err != nil {
+					return PoolConfig{}, fmt.Errorf("parse key for client %q: %w", c.ID, err)
+				}
+			} else {
+				key, err = readPoolKey(filepath.Join(baseDir, c.KeyFile))
+				if err != nil {
+					return PoolConfig{}, fmt.Errorf("read key for client %q: %w", c.ID, err)
+				}
 			}
 			cfg.Clients[c.ID] = key
 		}
-		if raw.ClientID != "" || raw.KeyFile != "" {
-			return PoolConfig{}, errors.New("exit pool config must use clients entries, not client_id/key_file")
+		if raw.ClientID != "" || raw.KeyFile != "" || raw.ClientKey != "" {
+			return PoolConfig{}, errors.New("exit pool config must use clients entries, not client_id/key_file/client_key")
 		}
 	default:
 		return PoolConfig{}, fmt.Errorf("unknown pool role %q", role)
@@ -253,10 +280,20 @@ func readPoolKey(path string) ([32]byte, error) {
 	if err != nil {
 		return key, err
 	}
-	s := strings.TrimSpace(string(data))
-	if decoded, err := hex.DecodeString(s); err == nil && len(decoded) == len(key) {
+	parsed, err := parsePoolKey(string(data))
+	if err != nil {
+		return key, err
+	}
+	return parsed, nil
+}
+
+func parsePoolKey(value string) ([32]byte, error) {
+	var key [32]byte
+	s := strings.TrimSpace(value)
+	decoded, err := hex.DecodeString(s)
+	if err == nil && len(decoded) == len(key) {
 		copy(key[:], decoded)
 		return key, nil
 	}
-	return key, errors.New("key file must contain a 32-byte key as 64 hex characters")
+	return key, errors.New("key must contain 32 bytes as 64 hexadecimal characters")
 }

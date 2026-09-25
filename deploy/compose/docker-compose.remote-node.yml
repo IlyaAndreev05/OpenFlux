@@ -1,0 +1,36 @@
+services:
+  openflux-node:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.node
+    image: openflux-node:local
+    restart: unless-stopped
+    environment:
+      OPENFLUX_CONTROL_URL: ${OPENFLUX_CONTROL_URL:?set OPENFLUX_CONTROL_URL}
+      OPENFLUX_NODE_ID: ${OPENFLUX_NODE_ID:?set OPENFLUX_NODE_ID}
+      OPENFLUX_NODE_TOKEN: ${OPENFLUX_NODE_TOKEN:?set OPENFLUX_NODE_TOKEN}
+      OPENFLUX_EXIT_MODE: ${OPENFLUX_EXIT_MODE:-l4}
+      OPENFLUX_CODEC: batched
+      OPENFLUX_NODE_STATE_DIR: /var/lib/openflux
+      OPENFLUX_NODE_HEALTH_ADDR: 127.0.0.1:8790
+    volumes:
+      - openflux-node-state:/var/lib/openflux
+    cap_add: [NET_ADMIN, NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      - default
+      - remnawave
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8790/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+
+networks:
+  default:
+  remnawave:
+    external: true
+    name: ${REMNAWAVE_DOCKER_NETWORK:-remnawave_default}
+volumes:
+  openflux-node-state:

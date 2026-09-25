@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/openflux . \
+ && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/openflux-node-agent ./cmd/openflux-node-agent
+
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates iptables wget
+COPY --from=build /out/openflux /usr/local/bin/openflux
+COPY --from=build /out/openflux-node-agent /usr/local/bin/openflux-node-agent
+ENV OPENFLUX_BINARY=/usr/local/bin/openflux \
+    OPENFLUX_NODE_STATE_DIR=/var/lib/openflux \
+    OPENFLUX_NODE_HEALTH_ADDR=127.0.0.1:8790
+RUN mkdir -p /var/lib/openflux && chmod 0700 /var/lib/openflux
+VOLUME ["/var/lib/openflux"]
+EXPOSE 8790
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 CMD wget -q -O - http://127.0.0.1:8790/healthz >/dev/null || exit 1
+ENTRYPOINT ["/usr/local/bin/openflux-node-agent"]

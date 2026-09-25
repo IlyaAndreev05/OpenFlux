@@ -218,6 +218,96 @@ func TestPoolExitDirectTCPWithoutForwardRouteOrXray(t *testing.T) {
 	}
 }
 
+func TestPoolExitReusesReleasedVirtualAddress(t *testing.T) {
+	exit := newMultiProxyExit(nil)
+	first, peer1 := newPoolExitTestMemoryPair()
+	second, peer2 := newPoolExitTestMemoryPair()
+	defer first.Stop()
+	defer peer1.Stop()
+	defer second.Stop()
+	defer peer2.Stop()
+	if err := exit.AddClient("first", first); err != nil {
+		t.Fatal(err)
+	}
+	firstIP := exit.clients["first"].ip
+	if firstIP != [4]byte{10, 64, 0, 1} {
+		t.Fatalf("first IP=%v", firstIP)
+	}
+	exit.RemoveClient("first")
+	if err := exit.AddClient("second", second); err != nil {
+		t.Fatal(err)
+	}
+	if got := exit.clients["second"].ip; got != firstIP {
+		t.Fatalf("reused IP=%v want %v", got, firstIP)
+	}
+	_ = exit.Stop()
+}
+
+func TestPoolExitPreservesTCPHalfClose(t *testing.T) {
+	destinationIP := poolExitTestNonLoopbackIPv4(t)
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	destination := net.JoinHostPort(destinationIP.String(), strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		body, err := io.ReadAll(conn)
+		if err == nil {
+			_, _ = io.WriteString(conn, "received:"+string(body))
+		}
+	}()
+	clientLink, exitLink := newPoolExitTestMemoryPair()
+	if err := clientLink.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer clientLink.Stop()
+	if err := exitLink.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exit, err := NewPoolExitNode(ExitModeL4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exit.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer exit.Stop()
+	if err := exit.AddClient("half-close", exitLink); err != nil {
+		t.Fatal(err)
+	}
+	clientTunnel := NewTCPTunnelMode(clientLink, false, ExitModeL4)
+	defer clientTunnel.Close()
+	conn, err := clientTunnel.DialTCP(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+	if _, err := io.WriteString(conn, "request-body"); err != nil {
+		t.Fatal(err)
+	}
+	half, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		t.Skip("tunnel TCP connection does not expose CloseWrite")
+	}
+	if err := half.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response) != "received:request-body" {
+		t.Fatalf("response=%q", response)
+	}
+}
+
 func poolExitTestNonLoopbackIPv4(t *testing.T) net.IP {
 	t.Helper()
 	addresses, err := net.InterfaceAddrs()

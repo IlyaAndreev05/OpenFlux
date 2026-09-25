@@ -8,13 +8,15 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"openflux/transport"
 )
 
 func TestPoolFrameEncodeDecode(t *testing.T) {
 	in := poolFrame{
-		Kind: poolData, Direction: 1, ClientID: "client-a", Epoch: 42,
+		Version: poolProtocolCurrent,
+		Kind:    poolData, Direction: 1, ClientID: "client-a", Epoch: 42,
 		DocID: "doc-b", Payload: []byte{0, 1, 2, 255},
 	}
 	in.SessionID[3] = 99
@@ -70,6 +72,155 @@ func TestPoolCipherDirectionalEncryptionAndReplayProtection(t *testing.T) {
 	}
 	if _, err := badExit.open(frame); err == nil {
 		t.Fatal("ciphertext decrypted in a different pool context")
+	}
+}
+
+func TestPoolCipherV2ReplayWindowAndSessionKeySeparation(t *testing.T) {
+	var key [32]byte
+	for i := range key {
+		key[i] = byte(i + 7)
+	}
+	var sid [16]byte
+	sid[0] = 9
+	client, err := newPoolSessionCipher(key, "pool", "alice", false, poolProtocolCurrent, sid, 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit, err := newPoolSessionCipher(key, "pool", "alice", true, poolProtocolCurrent, sid, 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := make([]poolFrame, poolReplayLimit+4)
+	for i := range frames {
+		frames[i], err = client.seal(poolFrame{Kind: poolData, ClientID: "alice", SessionID: sid, Epoch: 31}, []byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = exit.open(frames[i]); err != nil {
+			t.Fatalf("open sequence %d: %v", i+1, err)
+		}
+	}
+	if _, err := exit.open(frames[0]); err == nil {
+		t.Fatal("accepted sequence older than replay window")
+	}
+	if _, err := exit.open(frames[len(frames)-1]); err == nil {
+		t.Fatal("accepted replay of newest sequence")
+	}
+	other, err := newPoolSessionCipher(key, "pool", "alice", true, poolProtocolCurrent, sid, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.open(frames[len(frames)-1]); err == nil {
+		t.Fatal("accepted ciphertext with a different session key")
+	}
+}
+
+func TestPoolCipherLegacyV1RequiresExplicitMode(t *testing.T) {
+	var key [32]byte
+	key[0] = 42
+	client, err := newPoolCipherVersion(key, "legacy", "alice", false, poolProtocolLegacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit, err := newPoolCipherVersion(key, "legacy", "alice", true, poolProtocolLegacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := client.seal(poolFrame{Kind: poolData, ClientID: "alice"}, []byte("legacy migration"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := encodePoolFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodePoolFrame(wire)
+	if err != nil || decoded.Version != poolProtocolLegacy {
+		t.Fatalf("legacy decode: version=%d err=%v", decoded.Version, err)
+	}
+	plain, err := exit.open(decoded)
+	if err != nil || string(plain) != "legacy migration" {
+		t.Fatalf("legacy open: %q %v", plain, err)
+	}
+	v2, err := newPoolCipher(key, "legacy", "alice", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v2.open(decoded); err == nil {
+		t.Fatal("v2 implicitly downgraded to legacy ciphertext")
+	}
+}
+
+func TestPoolReplayHelloCannotReplaceLiveSession(t *testing.T) {
+	var key [32]byte
+	key[0] = 77
+	var oldSID [16]byte
+	oldSID[0] = 1
+	old := &PoolSession{BaseTransport: transport.NewBaseTransport(transport.DefaultConfig()), clientID: "alice", sessionID: oldSID, key: key, active: true, announced: true, docID: "doc-live", epoch: 4, lastSeen: time.Now()}
+	liveDoc := NewYandexDocsTransport("", transport.DefaultConfig())
+	liveDoc.SetConnected(true)
+	server := NewYandexDocsPoolServer(PoolConfig{PoolID: "test", Docs: []PoolDocument{{ID: "doc-live"}}, Clients: map[string][32]byte{"alice": key}}, transport.DefaultConfig(), nil, nil)
+	server.running.Store(true)
+	server.sessions["alice"] = old
+	server.docs["doc-live"] = liveDoc
+	var replaySID [16]byte
+	replaySID[0] = 2
+	frame := poolFrame{Version: poolProtocolCurrent, Kind: poolHello, ClientID: "alice", SessionID: replaySID, Challenge: [16]byte{1}, DocID: "doc-live"}
+	frame.Payload = poolProof(key, server.domain, frame)
+	server.handleHello("doc-live", frame)
+	if got := server.sessions["alice"]; got != old {
+		t.Fatal("valid HELLO replaced a fresh live session")
+	}
+}
+
+func TestPoolInvalidDataDoesNotRefreshSessionActivity(t *testing.T) {
+	var key [32]byte
+	key[0] = 18
+	var sid [16]byte
+	sid[0] = 3
+	cipherServer, err := newPoolSessionCipher(key, "v2\x00test", "alice", true, poolProtocolCurrent, sid, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-time.Minute)
+	session := &PoolSession{BaseTransport: transport.NewBaseTransport(transport.DefaultConfig()), clientID: "alice", sessionID: sid, key: key, cipher: cipherServer, active: true, announced: true, docID: "doc", epoch: 5, lastSeen: oldTime}
+	server := NewYandexDocsPoolServer(PoolConfig{PoolID: "test", Docs: []PoolDocument{{ID: "doc"}}, Clients: map[string][32]byte{"alice": key}}, transport.DefaultConfig(), nil, nil)
+	server.sessions["alice"] = session
+	bad := poolFrame{Version: poolProtocolCurrent, Kind: poolData, Direction: 0, ClientID: "alice", SessionID: sid, Epoch: 5, DocID: "doc", Payload: make([]byte, 32)}
+	server.handleData("doc", bad)
+	session.mu.RLock()
+	got := session.lastSeen
+	session.mu.RUnlock()
+	if !got.Equal(oldTime) {
+		t.Fatal("invalid ciphertext refreshed lastSeen")
+	}
+	clientCipher, err := newPoolSessionCipher(key, "v2\x00test", "alice", false, poolProtocolCurrent, sid, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := clientCipher.seal(poolFrame{Kind: poolData, ClientID: "alice", SessionID: sid, Epoch: 5, DocID: "doc"}, []byte("valid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.handleData("doc", good)
+	session.mu.RLock()
+	got = session.lastSeen
+	session.mu.RUnlock()
+	if !got.After(oldTime) {
+		t.Fatal("authenticated data did not refresh lastSeen")
+	}
+}
+
+func TestPoolV2IdentityDoesNotChangeWhenDocumentsRotate(t *testing.T) {
+	first := PoolConfig{PoolID: "stable", ProtocolVersion: poolProtocolCurrent, Docs: []PoolDocument{{ID: "a", URL: "https://one.invalid/doc"}}}
+	second := PoolConfig{PoolID: "stable", ProtocolVersion: poolProtocolCurrent, Docs: []PoolDocument{{ID: "b", URL: "https://two.invalid/doc"}}}
+	if poolDomain(first) != poolDomain(second) {
+		t.Fatal("rotating document URLs changed v2 pool identity")
+	}
+	first.ProtocolVersion = poolProtocolLegacy
+	second.ProtocolVersion = poolProtocolLegacy
+	if poolDomain(first) == poolDomain(second) {
+		t.Fatal("legacy migration context unexpectedly ignores document set")
 	}
 }
 
@@ -206,6 +357,24 @@ func TestLoadPoolConfigPerRole(t *testing.T) {
 	if _, err := LoadPoolConfig(invalidClientTCPPath, "client"); err == nil {
 		t.Fatal("accepted client tcp_target without a port")
 	}
+	inlinePath := writeConfig("client-inline.json", map[string]any{
+		"pool_id": "test", "protocol_version": 2, "documents": docs, "client_id": "device-1",
+		"client_key": hex.EncodeToString(keyHex),
+	})
+	inline, err := LoadPoolConfig(inlinePath, "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inline.ProtocolVersion != poolProtocolCurrent || inline.ClientID != "device-1" || inline.ClientKey[31] != 31 {
+		t.Fatalf("bad inline client config: %#v", inline)
+	}
+	conflictingPath := writeConfig("client-inline-and-file.json", map[string]any{
+		"pool_id": "test", "documents": docs, "client_id": "device-1", "key_file": "alice.key", "client_key": hex.EncodeToString(keyHex),
+	})
+	if _, err := LoadPoolConfig(conflictingPath, "client"); err == nil {
+		t.Fatal("accepted both inline key and key_file")
+	}
+
 	exitPath := writeConfig("exit.json", map[string]any{
 		"pool_id": "test", "strategy": "round-robin", "documents": docs,
 		"clients": []map[string]string{{"id": "alice", "key_file": "alice.key"}},

@@ -167,7 +167,8 @@ type multiProxyExit struct {
 	mu          sync.RWMutex
 	clients     map[string]*poolL4Client
 	byIP        map[[4]byte]*poolL4Client
-	nextIP      atomic.Uint32
+	nextIP      uint32
+	freeIPs     []uint32
 	started     atomic.Bool
 	startTime   time.Time
 	activeFlows atomic.Int64
@@ -209,20 +210,31 @@ func (t *multiProxyExit) AddClient(id string, trans transport.Transport) error {
 	if id == "" || trans == nil {
 		return fmt.Errorf("pool L4 client requires id and transport")
 	}
-	n := t.nextIP.Add(1)
-	if n >= 65535 {
-		return fmt.Errorf("pool L4 virtual address space exhausted")
+	t.mu.Lock()
+	var n uint32
+	var old *poolL4Client
+	if old = t.clients[id]; old != nil {
+		n = poolL4AddressIndex(old.ip)
+		delete(t.byIP, old.ip)
+	} else if count := len(t.freeIPs); count > 0 {
+		n = t.freeIPs[count-1]
+		t.freeIPs = t.freeIPs[:count-1]
+	} else {
+		if t.nextIP >= 65534 {
+			t.mu.Unlock()
+			return fmt.Errorf("pool L4 virtual address space exhausted")
+		}
+		t.nextIP++
+		n = t.nextIP
 	}
 	ip := [4]byte{10, 64, byte(n >> 8), byte(n)}
 	client := &poolL4Client{id: id, ip: ip, Transport: trans}
-	t.mu.Lock()
-	if old := t.clients[id]; old != nil {
-		delete(t.byIP, old.ip)
-		_ = old.Transport.Stop()
-	}
 	t.clients[id] = client
 	t.byIP[ip] = client
 	t.mu.Unlock()
+	if old != nil {
+		_ = old.Transport.Stop()
+	}
 	trans.Receive(func(pkt []byte) {
 		cp, ok := poolRewriteIPv4Address(pkt, 12, [4]byte{10, 10, 10, 2}, ip)
 		if !ok {
@@ -233,12 +245,17 @@ func (t *multiProxyExit) AddClient(id string, trans transport.Transport) error {
 	return nil
 }
 
+func poolL4AddressIndex(ip [4]byte) uint32 {
+	return uint32(ip[2])<<8 | uint32(ip[3])
+}
+
 func (t *multiProxyExit) RemoveClient(id string) {
 	t.mu.Lock()
 	client := t.clients[id]
 	if client != nil {
 		delete(t.clients, id)
 		delete(t.byIP, client.ip)
+		t.freeIPs = append(t.freeIPs, poolL4AddressIndex(client.ip))
 	}
 	t.mu.Unlock()
 	if client != nil {
@@ -309,12 +326,17 @@ func (t *multiProxyExit) handleExitTCP(r *tcp.ForwarderRequest) {
 			_ = tc.SetReadBuffer(16 * 1024 * 1024)
 			_ = tc.SetWriteBuffer(16 * 1024 * 1024)
 		}
+		toRemoteDone := make(chan struct{})
 		go func() {
+			defer close(toRemoteDone)
 			_, _ = io.Copy(remote, local)
-			_ = remote.Close()
-			_ = local.Close()
+			if half, ok := remote.(interface{ CloseWrite() error }); ok {
+				_ = half.CloseWrite()
+			}
 		}()
 		_, _ = io.Copy(local, remote)
+		_ = local.CloseWrite()
+		<-toRemoteDone
 		_ = local.Close()
 		_ = remote.Close()
 	})
